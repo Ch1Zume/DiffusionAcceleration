@@ -7,10 +7,9 @@ base = imp.load_source("base", os.path.join(os.path.dirname(__file__), "base.py"
 def get_config(name):
     return globals()[name]()
 
-
 def _get_config(base_model="sd3", n_gpus=1, gradient_step_per_epoch=1, dataset="pickscore", reward_fn={}, name=""):
     config = base.get_config()
-    assert base_model in ["sd3"]
+    assert base_model in ["sd3", "flux"]
     assert dataset in ["pickscore", "ocr", "geneval"]
 
     config.base_model = base_model
@@ -23,9 +22,18 @@ def _get_config(base_model="sd3", n_gpus=1, gradient_step_per_epoch=1, dataset="
         config.resolution = 512
         config.train.beta = 0.0001
         config.sample.noise_level = 0.7
-        bsz = 9
+        bsz = 9 # default: 9
+    elif base_model == "flux":
+        config.pretrained.model = "black-forest-labs/FLUX.1-dev"
+        config.sample.num_steps = 10
+        config.sample.eval_num_steps = 40
+        config.sample.guidance_scale = 4.5
+        config.resolution = 512
+        config.train.beta = 0.0001
+        config.sample.noise_level = 0.7
+        bsz = 9 # default: 9
 
-    config.sample.num_image_per_prompt = 24
+    config.sample.num_image_per_prompt = 18 # default: 24
     num_groups = 48
 
     while True:
@@ -72,7 +80,12 @@ def sd3_ocr():
         "ocr": 1.0,
     }
     config = _get_config(
-        base_model="sd3", n_gpus=8, gradient_step_per_epoch=2, dataset="ocr", reward_fn=reward_fn, name="ocr"
+        base_model="sd3", 
+        n_gpus=2, 
+        gradient_step_per_epoch=2, 
+        dataset="ocr", 
+        reward_fn=reward_fn, 
+        name="ocr"
     )
     config.beta = 0.1
     config.decay_type = 2
@@ -85,7 +98,7 @@ def sd3_geneval():
     }
     config = _get_config(
         base_model="sd3",
-        n_gpus=8,
+        n_gpus=2,
         gradient_step_per_epoch=1,
         dataset="geneval",
         reward_fn=reward_fn,
@@ -100,7 +113,7 @@ def sd3_pickscore():
     }
     config = _get_config(
         base_model="sd3",
-        n_gpus=8,
+        n_gpus=2,
         gradient_step_per_epoch=1,
         dataset="pickscore",
         reward_fn=reward_fn,
@@ -114,7 +127,12 @@ def sd3_hpsv2():
         "hpsv2": 1.0,
     }
     config = _get_config(
-        base_model="sd3", n_gpus=8, gradient_step_per_epoch=1, dataset="pickscore", reward_fn=reward_fn, name="hpsv2"
+        base_model="sd3", 
+        n_gpus=2, 
+        gradient_step_per_epoch=1, 
+        dataset="pickscore", 
+        reward_fn=reward_fn, 
+        name="hpsv2"
     )
     return config
 
@@ -127,7 +145,87 @@ def sd3_multi_reward():
     }
     config = _get_config(
         base_model="sd3",
-        n_gpus=8,
+        n_gpus=2,
+        gradient_step_per_epoch=1,
+        dataset="pickscore",
+        reward_fn=reward_fn,
+        name="multi_reward",
+    )
+    config.sample.num_steps = 25
+    config.beta = 0.1
+    return config
+
+def flux_ocr():
+    reward_fn = {
+        "ocr": 1.0,
+    }
+    config = _get_config(
+        base_model="flux", 
+        n_gpus=2, 
+        gradient_step_per_epoch=2, 
+        dataset="ocr", 
+        reward_fn=reward_fn, 
+        name="ocr"
+    )
+    config.beta = 0.1
+    config.decay_type = 2
+    return config
+
+
+def flux_geneval():
+    reward_fn = {
+        "geneval": 1.0,
+    }
+    config = _get_config(
+        base_model="flux",
+        n_gpus=2,
+        gradient_step_per_epoch=1,
+        dataset="geneval",
+        reward_fn=reward_fn,
+        name="geneval",
+    )
+    return config
+
+
+def flux_pickscore():
+    reward_fn = {
+        "pickscore": 1.0,
+    }
+    config = _get_config(
+        base_model="flux",
+        n_gpus=2,
+        gradient_step_per_epoch=1,
+        dataset="pickscore",
+        reward_fn=reward_fn,
+        name="pickscore",
+    )
+    return config
+
+
+def flux_hpsv2():
+    reward_fn = {
+        "hpsv2": 1.0,
+    }
+    config = _get_config(
+        base_model="flux", 
+        n_gpus=2, 
+        gradient_step_per_epoch=1, 
+        dataset="pickscore", 
+        reward_fn=reward_fn, 
+        name="hpsv2"
+    )
+    return config
+
+
+def flux_multi_reward():
+    reward_fn = {
+        "pickscore": 1.0,
+        "hpsv2": 1.0,
+        "clipscore": 1.0,
+    }
+    config = _get_config(
+        base_model="flux",
+        n_gpus=2,
         gradient_step_per_epoch=1,
         dataset="pickscore",
         reward_fn=reward_fn,

@@ -1,18 +1,3 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 from collections import defaultdict
 import os
 import datetime
@@ -21,12 +6,12 @@ import time
 import json
 from absl import app, flags
 import logging
-from diffusers import StableDiffusion3Pipeline
+from diffusers import FluxPipeline
 import numpy as np
 import flow_grpo.rewards
 from flow_grpo.stat_tracking import PerPromptStatTracker
 from flow_grpo.diffusers_patch.pipeline_with_logprob import pipeline_with_logprob
-from flow_grpo.diffusers_patch.train_dreambooth_lora_sd3 import encode_prompt
+from flow_grpo.diffusers_patch.train_dreambooth_lora_flux import encode_prompt
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -160,9 +145,12 @@ def gather_tensor_to_all(tensor, world_size):
 
 def compute_text_embeddings(prompt, text_encoders, tokenizers, max_sequence_length, device):
     with torch.no_grad():
-        prompt_embeds, pooled_prompt_embeds = encode_prompt(text_encoders, tokenizers, prompt, max_sequence_length)
+        prompt_embeds, pooled_prompt_embeds, text_ids = encode_prompt(
+            text_encoders, tokenizers, prompt, max_sequence_length
+        )
         prompt_embeds = prompt_embeds.to(device)
         pooled_prompt_embeds = pooled_prompt_embeds.to(device)
+        text_ids = text_ids.to(device)
     return prompt_embeds, pooled_prompt_embeds
 
 
@@ -264,7 +252,7 @@ def eval_fn(
 
         with torch_autocast(enabled=(config.mixed_precision in ["fp16", "bf16"]), dtype=mixed_precision_dtype):
             with torch.no_grad():
-                images, _, _ = pipeline_with_logprob(
+                images, _, _, _, _ = pipeline_with_logprob(
                     pipeline,
                     prompt_embeds=prompt_embeds,
                     pooled_prompt_embeds=pooled_prompt_embeds,
@@ -278,7 +266,7 @@ def eval_fn(
                     noise_level=config.sample.noise_level,
                     deterministic=True,
                     solver="flow",
-                    model_type="sd3",
+                    model_type="flux",
                 )
 
         rewards_future = executor.submit(reward_fn, images, prompts, prompt_metadata, only_strict=False)
@@ -390,14 +378,13 @@ def main(_):
     scaler = GradScaler(enabled=enable_amp)
 
     # --- Load pipeline and models ---
-    pipeline = StableDiffusion3Pipeline.from_pretrained(config.pretrained.model)
+    pipeline = FluxPipeline.from_pretrained(config.pretrained.model)
     pipeline.vae.requires_grad_(False)
     pipeline.text_encoder.requires_grad_(False)
     pipeline.text_encoder_2.requires_grad_(False)
-    pipeline.text_encoder_3.requires_grad_(False)
     pipeline.transformer.requires_grad_(not config.use_lora)
-    text_encoders = [pipeline.text_encoder, pipeline.text_encoder_2, pipeline.text_encoder_3]
-    tokenizers = [pipeline.tokenizer, pipeline.tokenizer_2, pipeline.tokenizer_3]
+    text_encoders = [pipeline.text_encoder, pipeline.text_encoder_2]
+    tokenizers = [pipeline.tokenizer, pipeline.tokenizer_2]
     pipeline.safety_checker = None
     pipeline.set_progress_bar_config(
         position=1,
@@ -412,7 +399,6 @@ def main(_):
     pipeline.vae.to(device, dtype=torch.float32)  # VAE usually fp32
     pipeline.text_encoder.to(device, dtype=text_encoder_dtype)
     pipeline.text_encoder_2.to(device, dtype=text_encoder_dtype)
-    pipeline.text_encoder_3.to(device, dtype=text_encoder_dtype)
 
     transformer = pipeline.transformer.to(device)
 
@@ -643,7 +629,7 @@ def main(_):
             transformer_ddp.module.set_adapter("old")
             with torch_autocast(enabled=enable_amp, dtype=mixed_precision_dtype):
                 with torch.no_grad():
-                    images, latents, _ = pipeline_with_logprob(
+                    images, latents, image_ids, text_ids, log_probs = pipeline_with_logprob(
                         pipeline,
                         prompt_embeds=prompt_embeds,
                         pooled_prompt_embeds=pooled_prompt_embeds,
@@ -657,7 +643,7 @@ def main(_):
                         noise_level=config.sample.noise_level,
                         deterministic=config.sample.deterministic,
                         solver=config.sample.solver,
-                        model_type="sd3",
+                        model_type="flux",
                     )
             transformer_ddp.module.set_adapter("default")
 
@@ -897,6 +883,8 @@ def main(_):
                                 timestep=train_sample_batch["timesteps"][:, j_idx],
                                 encoder_hidden_states=embeds,
                                 pooled_projections=pooled_embeds,
+                                text_ids=text_ids,
+                                image_ids=image_ids,
                                 return_dict=False,
                             )[0].detach()
 
@@ -920,6 +908,8 @@ def main(_):
                                         timestep=train_sample_batch["timesteps"][:, j_idx],
                                         encoder_hidden_states=embeds,
                                         pooled_projections=pooled_embeds,
+                                        text_ids=text_ids,
+                                        image_ids=image_ids,
                                         return_dict=False,
                                     )[0]
                                 transformer_ddp.module.set_adapter("default")

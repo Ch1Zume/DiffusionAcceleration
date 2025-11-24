@@ -175,6 +175,8 @@ def ocr_score(device):
 
     return _fn
 
+# def acceleration_score(device)
+
 
 def unifiedreward_score_sglang(device):
     import asyncio
