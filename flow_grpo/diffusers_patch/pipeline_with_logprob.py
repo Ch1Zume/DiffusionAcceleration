@@ -232,7 +232,8 @@ def pipeline_with_logprob(
                 guidance = guidance.expand(latent_model_input.shape[0])
             else:
                 guidance = None
-            timesteps = torch.full([latent_model_input.shape[0]], sigma, device=z.device, dtype=torch.long)
+            # timesteps = torch.full([latent_model_input.shape[0]], sigma, device=z.device, dtype=torch.long)
+            timesteps = torch.full([latent_model_input.shape[0]], sigma, device=z.device, dtype=torch.float32)
             noise_pred = self.transformer(
                 hidden_states=latent_model_input,
                 timestep=timesteps,

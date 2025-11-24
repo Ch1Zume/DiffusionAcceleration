@@ -84,7 +84,7 @@ def get_config():
     train.adv_clip_max = 5
     # the fraction of timesteps to train on. if set to less than 1.0, the model will be trained on a subset of the
     # timesteps for each sample. this will speed up training but reduce the accuracy of policy gradient estimates.
-    train.timestep_fraction = 0.79
+    train.timestep_fraction = 0.99
     # kl ratio
     train.beta = 0.0001
     # pretrained lora path

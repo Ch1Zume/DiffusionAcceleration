@@ -494,6 +494,11 @@ def main(_):
     )
 
     # --- Prompt Embeddings ---
+    # prompt embed: 正向prompt嵌入，由具体使用的dataset在后面得到
+    # pooled prompt embed: CLIP得到的池化嵌入，用于捕捉全局语义信息
+    # neg: CFG用的反向prompt嵌入，通常是空字符串的嵌入。CFG训练的时候随机进行无条件预测，也就是prompt为空，因此这样设置
+    # sample: forward rollout，生成计算reward的图像时用的
+    # train: 后面训练用的
     neg_prompt_embed, neg_pooled_prompt_embed = compute_text_embeddings(
         [""], text_encoders, tokenizers, max_sequence_length=128, device=device
     )
@@ -509,6 +514,7 @@ def main(_):
     else:
         assert False
 
+    # 异步计算奖励分数
     executor = futures.ThreadPoolExecutor(max_workers=8)  # Async reward computation
 
     # Train!
@@ -563,10 +569,12 @@ def main(_):
             global_step = 0
 
     ema = None
+    # smoothing
     if config.train.ema:
         ema = EMAModuleWrapper(transformer_trainable_parameters, decay=0.9, update_step_interval=1, device=device)
 
     # 10 * 0.99
+    # 选取用于训练的采样步，越少速度越快，相应的效果越差
     num_train_timesteps = int(config.sample.num_steps * config.train.timestep_fraction)
 
     logger.info("***** Running training *****")
@@ -609,23 +617,23 @@ def main(_):
                 prompts, padding="max_length", max_length=256, truncation=True, return_tensors="pt"
             ).input_ids.to(device)
 
-            # if i == 0 and epoch % config.eval_freq == 0 and not config.debug:
-            #     eval_fn(
-            #         pipeline,
-            #         test_dataloader,
-            #         text_encoders,
-            #         tokenizers,
-            #         config,
-            #         device,
-            #         rank,
-            #         world_size,
-            #         global_step,
-            #         eval_reward_fn,
-            #         executor,
-            #         mixed_precision_dtype,
-            #         ema,
-            #         transformer_trainable_parameters,
-            #     )
+            if i == 0 and epoch % config.eval_freq == 0 and not config.debug:
+                eval_fn(
+                    pipeline,
+                    test_dataloader,
+                    text_encoders,
+                    tokenizers,
+                    config,
+                    device,
+                    rank,
+                    world_size,
+                    global_step,
+                    eval_reward_fn,
+                    executor,
+                    mixed_precision_dtype,
+                    ema,
+                    transformer_trainable_parameters,
+                )
 
             if i == 0 and epoch % config.save_freq == 0 and is_main_process(rank) and not config.debug:
                 save_ckpt(
@@ -661,8 +669,8 @@ def main(_):
                     )
             transformer_ddp.module.set_adapter("default")
 
-            latents = torch.stack(latents, dim=1)
-            timesteps = pipeline.scheduler.timesteps.repeat(len(prompts), 1).to(device)
+            latents = torch.stack(latents, dim=1) 
+            timesteps = pipeline.scheduler.timesteps.repeat(len(prompts), 1).to(device) 
 
             rewards_future = executor.submit(reward_fn, images, prompts, prompt_metadata, only_strict=True)
             time.sleep(0)
@@ -674,7 +682,7 @@ def main(_):
                     "pooled_prompt_embeds": pooled_prompt_embeds,
                     "timesteps": timesteps,
                     "next_timesteps": torch.concatenate([timesteps[:, 1:], torch.zeros_like(timesteps[:, :1])], dim=1),
-                    "latents_clean": latents[:, -1],
+                    "latents_clean": latents[:, -1], # 预测目标
                     "rewards_future": rewards_future,  # Store future
                 }
             )
@@ -846,7 +854,8 @@ def main(_):
             ):
                 current_micro_batch_size = len(train_sample_batch["prompt_embeds"])
 
-                if config.sample.guidance_scale > 1.0:
+                if config.sample.guidance_scale > 1.0: # using CFG
+                    # 将负向嵌入和正向嵌入拼接在一起
                     embeds = torch.cat(
                         [train_neg_prompt_embeds[:current_micro_batch_size], train_sample_batch["prompt_embeds"]]
                     )
@@ -985,7 +994,7 @@ def main(_):
 
                     # for high quality image with high reward: contribute more, push forward pred towards positive pred
                     # for low quality image with low reward: contribute less, pull forward pred away from negative pred
-                    ori_policy_loss = r * positive_loss / config.beta + (1.0 - r) * negative_loss / config.beta
+                    ori_policy_loss = r * positive_loss / config.beta + (1.0 - r) * negative_loss / config.beta # Eq.5 in paper
                     policy_loss = (ori_policy_loss * config.train.adv_clip_max).mean()
 
                     loss = policy_loss

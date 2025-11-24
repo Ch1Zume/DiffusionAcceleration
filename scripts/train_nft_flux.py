@@ -209,13 +209,14 @@ def eval_fn(
         ema.copy_ema_to(transformer_trainable_parameters, store_temp=True)
 
     pipeline.transformer.eval()
+    pipeline.transformer.config.guidance_embeds = (config.sample.guidance_scale > 1.0)
 
-    neg_prompt_embed, neg_pooled_prompt_embed = compute_text_embeddings(
-        [""], text_encoders, tokenizers, max_sequence_length=128, device=device
-    )
+    # neg_prompt_embed, neg_pooled_prompt_embed = compute_text_embeddings(
+    #     [""], text_encoders, tokenizers, max_sequence_length=128, device=device
+    # )
 
-    sample_neg_prompt_embeds = neg_prompt_embed.repeat(config.sample.test_batch_size, 1, 1)
-    sample_neg_pooled_prompt_embeds = neg_pooled_prompt_embed.repeat(config.sample.test_batch_size, 1)
+    # sample_neg_prompt_embeds = neg_prompt_embed.repeat(config.sample.test_batch_size, 1, 1)
+    # sample_neg_pooled_prompt_embeds = neg_pooled_prompt_embed.repeat(config.sample.test_batch_size, 1)
 
     all_rewards = defaultdict(list)
 
@@ -242,13 +243,13 @@ def eval_fn(
         prompt_embeds, pooled_prompt_embeds = compute_text_embeddings(
             prompts, text_encoders, tokenizers, max_sequence_length=128, device=device
         )
-        current_batch_size = len(prompt_embeds)
-        if current_batch_size < len(sample_neg_prompt_embeds):  # Handle last batch
-            current_sample_neg_prompt_embeds = sample_neg_prompt_embeds[:current_batch_size]
-            current_sample_neg_pooled_prompt_embeds = sample_neg_pooled_prompt_embeds[:current_batch_size]
-        else:
-            current_sample_neg_prompt_embeds = sample_neg_prompt_embeds
-            current_sample_neg_pooled_prompt_embeds = sample_neg_pooled_prompt_embeds
+        # current_batch_size = len(prompt_embeds)
+        # if current_batch_size < len(sample_neg_prompt_embeds):  # Handle last batch
+        #     current_sample_neg_prompt_embeds = sample_neg_prompt_embeds[:current_batch_size]
+        #     current_sample_neg_pooled_prompt_embeds = sample_neg_pooled_prompt_embeds[:current_batch_size]
+        # else:
+        #     current_sample_neg_prompt_embeds = sample_neg_prompt_embeds
+        #     current_sample_neg_pooled_prompt_embeds = sample_neg_pooled_prompt_embeds
 
         with torch_autocast(enabled=(config.mixed_precision in ["fp16", "bf16"]), dtype=mixed_precision_dtype):
             with torch.no_grad():
@@ -256,8 +257,8 @@ def eval_fn(
                     pipeline,
                     prompt_embeds=prompt_embeds,
                     pooled_prompt_embeds=pooled_prompt_embeds,
-                    negative_prompt_embeds=current_sample_neg_prompt_embeds,
-                    negative_pooled_prompt_embeds=current_sample_neg_pooled_prompt_embeds,
+                    # negative_prompt_embeds=current_sample_neg_prompt_embeds,
+                    # negative_pooled_prompt_embeds=current_sample_neg_pooled_prompt_embeds,
                     num_inference_steps=config.sample.eval_num_steps,
                     guidance_scale=config.sample.guidance_scale,
                     output_type="pt",
@@ -400,6 +401,10 @@ def main(_):
     pipeline.text_encoder.to(device, dtype=text_encoder_dtype)
     pipeline.text_encoder_2.to(device, dtype=text_encoder_dtype)
 
+    # enable CFG if guidance > 1
+    # if config.sample.guidance_scale > 1.0:
+    #     pipeline.transformer.config.guidance_embeds = True
+
     transformer = pipeline.transformer.to(device)
 
     if config.use_lora:
@@ -480,13 +485,13 @@ def main(_):
     )
 
     # --- Prompt Embeddings ---
-    neg_prompt_embed, neg_pooled_prompt_embed = compute_text_embeddings(
-        [""], text_encoders, tokenizers, max_sequence_length=128, device=device
-    )
-    sample_neg_prompt_embeds = neg_prompt_embed.repeat(config.sample.train_batch_size, 1, 1)
-    train_neg_prompt_embeds = neg_prompt_embed.repeat(config.train.batch_size, 1, 1)
-    sample_neg_pooled_prompt_embeds = neg_pooled_prompt_embed.repeat(config.sample.train_batch_size, 1)
-    train_neg_pooled_prompt_embeds = neg_pooled_prompt_embed.repeat(config.train.batch_size, 1)
+    # neg_prompt_embed, neg_pooled_prompt_embed = compute_text_embeddings(
+    #     [""], text_encoders, tokenizers, max_sequence_length=128, device=device
+    # )
+    # sample_neg_prompt_embeds = neg_prompt_embed.repeat(config.sample.train_batch_size, 1, 1)
+    # train_neg_prompt_embeds = neg_prompt_embed.repeat(config.train.batch_size, 1, 1)
+    # sample_neg_pooled_prompt_embeds = neg_pooled_prompt_embed.repeat(config.sample.train_batch_size, 1)
+    # train_neg_pooled_prompt_embeds = neg_pooled_prompt_embed.repeat(config.train.batch_size, 1)
 
     if config.sample.num_image_per_prompt == 1:
         config.per_prompt_stat_tracking = False
@@ -570,9 +575,9 @@ def main(_):
         if hasattr(train_sampler, "set_epoch"):
             train_sampler.set_epoch(epoch)
 
-        # SAMPLING, forward rollout
-        if is_main_process(rank):
-            start_time = time.perf_counter()
+        # =====================================SAMPLING==================================
+        # if is_main_process(rank):
+        #     start_time = time.perf_counter()
         pipeline.transformer.eval()
         samples_data_list = []
 
@@ -633,8 +638,8 @@ def main(_):
                         pipeline,
                         prompt_embeds=prompt_embeds,
                         pooled_prompt_embeds=pooled_prompt_embeds,
-                        negative_prompt_embeds=sample_neg_prompt_embeds[: len(prompts)],
-                        negative_pooled_prompt_embeds=sample_neg_pooled_prompt_embeds[: len(prompts)],
+                        # negative_prompt_embeds=sample_neg_prompt_embeds[: len(prompts)],
+                        # negative_pooled_prompt_embeds=sample_neg_pooled_prompt_embeds[: len(prompts)],
                         num_inference_steps=config.sample.num_steps,
                         guidance_scale=config.sample.guidance_scale,
                         output_type="pt",
@@ -658,6 +663,8 @@ def main(_):
                     "prompt_ids": prompt_ids,
                     "prompt_embeds": prompt_embeds,
                     "pooled_prompt_embeds": pooled_prompt_embeds,
+                    # "image_ids": image_ids,
+                    # "text_ids": text_ids,
                     "timesteps": timesteps,
                     "next_timesteps": torch.concatenate([timesteps[:, 1:], torch.zeros_like(timesteps[:, :1])], dim=1),
                     "latents_clean": latents[:, -1],
@@ -665,10 +672,10 @@ def main(_):
                 }
             )
 
-        if is_main_process(rank):
-            end_time = time.perf_counter()
-            reverse_time = end_time - start_time
-            print(f'Time for Reverse Rollout (image sampling): {reverse_time:.6f} s')
+        # if is_main_process(rank):
+        #     end_time = time.perf_counter()
+        #     reverse_time = end_time - start_time
+        #     print(f'Time for Reverse Rollout (image sampling): {reverse_time:.6f} s')
 
         for sample_item in tqdm(
             samples_data_list, desc="Waiting for rewards", disable=not is_main_process(rank), position=0
@@ -686,6 +693,9 @@ def main(_):
             )
             for k in samples_data_list[0].keys()
         }
+
+        collated_samples["image_ids"] = samples_data_list[0]["image_ids"]
+        collated_samples["text_ids"] = samples_data_list[0]["text_ids"]
 
         # Logging images (main process)
         if epoch % 10 == 0 and is_main_process(rank):
@@ -788,9 +798,9 @@ def main(_):
 
         total_batch_size_filtered, num_timesteps_filtered = filtered_samples["timesteps"].shape
 
-        # TRAINING, reverse process
-        if is_main_process(rank):
-            start_time = time.perf_counter()
+        # ======================================= TRAINING ==================================
+        # if is_main_process(rank):
+        #     start_time = time.perf_counter()
         transformer_ddp.train()  # Sets DDP model and its submodules to train mode.
 
         # Total number of backward passes before an optimizer step
@@ -799,6 +809,7 @@ def main(_):
         current_accumulated_steps = 0  # Counter for backward passes
         gradient_update_times = 0
 
+        # sample复用（如果有的话）
         for inner_epoch in range(config.train.num_inner_epochs):
             perm = torch.randperm(total_batch_size_filtered, device=device)
             shuffled_filtered_samples = {k: v[perm] for k, v in filtered_samples.items()}
@@ -830,21 +841,32 @@ def main(_):
                 position=0,
                 disable=not is_main_process(rank),
             ):
-                current_micro_batch_size = len(train_sample_batch["prompt_embeds"])
+                # FLUX executes CFG inside the model, no need to concate the prompts
+                # current_micro_batch_size = len(train_sample_batch["prompt_embeds"])
 
-                if config.sample.guidance_scale > 1.0:
-                    embeds = torch.cat(
-                        [train_neg_prompt_embeds[:current_micro_batch_size], train_sample_batch["prompt_embeds"]]
-                    )
-                    pooled_embeds = torch.cat(
-                        [
-                            train_neg_pooled_prompt_embeds[:current_micro_batch_size],
-                            train_sample_batch["pooled_prompt_embeds"],
-                        ]
-                    )
-                else:
-                    embeds = train_sample_batch["prompt_embeds"]
-                    pooled_embeds = train_sample_batch["pooled_prompt_embeds"]
+                # if config.sample.guidance_scale > 1.0:
+                #     embeds = torch.cat(
+                #         [
+                #             train_neg_prompt_embeds[:current_micro_batch_size], 
+                #             train_sample_batch["prompt_embeds"]
+                #         ]
+                #     )
+                #     pooled_embeds = torch.cat(
+                #         [
+                #             train_neg_pooled_prompt_embeds[:current_micro_batch_size],
+                #             train_sample_batch["pooled_prompt_embeds"],
+                #         ]
+                #     )
+                # else:
+                #     embeds = train_sample_batch["prompt_embeds"]
+                #     pooled_embeds = train_sample_batch["pooled_prompt_embeds"]
+
+                
+
+                embeds = train_sample_batch["prompt_embeds"]
+                pooled_embeds = train_sample_batch["pooled_prompt_embeds"]
+                img_ids = train_sample_batch["image_ids"]
+                txt_ids = train_sample_batch["text_ids"]
 
                 #=========================================Main Training Part=========================================
 
@@ -859,10 +881,11 @@ def main(_):
                 # Forward Rollout
                     assert j_idx == j_timestep_orig_idx
                     # clean images
-                    x0 = train_sample_batch["latents_clean"]
+                    x0 = train_sample_batch["latents_clean"]  
 
                     # intermediate time steps
                     t = train_sample_batch["timesteps"][:, j_idx] / 1000.0
+                    # t = train_sample_batch["timesteps"][:, j_idx]
 
                     # broadcast to the entire image
                     t_expanded = t.view(-1, *([1] * (len(x0.shape) - 1)))
@@ -872,19 +895,30 @@ def main(_):
                     # Forward process
                     xt = (1 - t_expanded) * x0 + t_expanded * noise
 
+                    # guidance就是一个标量，不是某种latent
+                    if transformer_ddp.module.config.guidance_embeds:
+                        guidance = torch.tensor([config.sample.guidance_scale], device=device, dtype=torch.float32)
+                        guidance = guidance.expand(xt.shape[0])
+                    else:
+                        guidance = None
+
                     with torch_autocast(enabled=enable_amp, dtype=mixed_precision_dtype):
                         # policy switching by switching the LoRA adapter
                         # old policy + x_t --> old prediction
                         transformer_ddp.module.set_adapter("old")
                         with torch.no_grad():
                             # prediction v
+                            print(xt.shape)
+                            print(img_ids).shape
+                            print(txt_ids).shape
                             old_prediction = transformer_ddp(
                                 hidden_states=xt,
                                 timestep=train_sample_batch["timesteps"][:, j_idx],
                                 encoder_hidden_states=embeds,
                                 pooled_projections=pooled_embeds,
-                                text_ids=text_ids,
-                                image_ids=image_ids,
+                                guidance=guidance,
+                                txt_ids=txt_ids,
+                                img_ids=img_ids,
                                 return_dict=False,
                             )[0].detach()
 
@@ -895,6 +929,9 @@ def main(_):
                             timestep=train_sample_batch["timesteps"][:, j_idx],
                             encoder_hidden_states=embeds,
                             pooled_projections=pooled_embeds,
+                            guidance=guidance,
+                            txt_ids=txt_ids,
+                            img_ids=img_ids,
                             return_dict=False,
                         )[0]
 
@@ -908,8 +945,9 @@ def main(_):
                                         timestep=train_sample_batch["timesteps"][:, j_idx],
                                         encoder_hidden_states=embeds,
                                         pooled_projections=pooled_embeds,
-                                        text_ids=text_ids,
-                                        image_ids=image_ids,
+                                        guidance=guidance,
+                                        txt_ids=txt_ids,
+                                        img_ids=img_ids,
                                         return_dict=False,
                                     )[0]
                                 transformer_ddp.module.set_adapter("default")
@@ -1049,11 +1087,11 @@ def main(_):
                 ):
                     ema.step(transformer_trainable_parameters, global_step)
         
-        if is_main_process(rank):
-            end_time = time.perf_counter()
-            forward_time = end_time - start_time
-            print(f'Time for Forward Process (noising): {forward_time:.6f} s')
-            print(f'Ratio of Forward/Reverse: {forward_time / reverse_time}')
+        # if is_main_process(rank):
+        #     end_time = time.perf_counter()
+        #     forward_time = end_time - start_time
+        #     print(f'Time for Forward Process (noising): {forward_time:.6f} s')
+        #     print(f'Ratio of Forward/Reverse: {forward_time / reverse_time}')
 
         if world_size > 1:
             dist.barrier()
