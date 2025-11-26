@@ -74,6 +74,128 @@ def run_sampling(
     # all_log_probs = torch.stack(all_log_probs, dim=1)  # (batch_size, num_steps, 1)
     return latents, all_latents, all_log_probs
 
+def run_sampling_cached(
+    v_pred_fn,
+    z,
+    sigma_schedule,
+    solver="flow",
+    determistic=False,
+    eta=0.7,
+    cache_actions=None,
+):
+    """
+    sigma: predicted noise
+    cache_actions:
+        - None: same as full compute
+        - Tensor: 1-full compute; 0-cache; decide for every single timestep
+    """
+    assert solver in ["flow", "dance", "ddim", "dpm1", "dpm2"]
+    dtype = z.dtype
+    device = z.device
+    all_latents = [z]
+    all_log_probs = []
+
+    num_steps = len(sigma_schedule) - 1
+    batch_size = z.shape[0]
+
+    # cache_actions: [batch_size, nums_timestep]
+    if cache_actions is not None:
+        cache_actions = cache_actions.to(device)
+        if cache_actions.dim() != 2:
+            raise ValueError("cache_actions must be 2D (steps x batch or batch x steps)")
+
+        if cache_actions.shape[0] == batch_size and cache_actions.shape[1] == num_steps:
+            cache_actions = cache_actions.transpose(0, 1)
+        elif cache_actions.shape[0] == num_steps and cache_actions.shape[1] == batch_size:
+            pass
+        else:
+            raise ValueError(
+                f"cache_actions shape mismatch: got {tuple(cache_actions.shape)}, "
+                f"expected (num_steps={num_steps}, B={batch_size}) or (B, num_steps)"
+            )
+
+        # Convert into bool values
+        cache_actions = cache_actions.bool()
+
+    # store cache
+    cached_pred = None
+
+    if "dpm" in solver:
+        order = int(solver[-1])
+        dpm_state = DPMState(order=order)
+
+    for i in tqdm(
+        range(num_steps),
+        desc="Sampling Progress (cached)",
+        disable=not dist.is_initialized() or dist.get_rank() != 0,
+    ):
+        sigma = sigma_schedule[i]
+
+        if cache_actions is None: # full compute
+            pred = v_pred_fn(z.to(dtype), sigma)
+            cached_pred = pred.detach()
+        else: # use cache
+            use_full = cache_actions[i]
+
+            pred = torch.empty_like(z, dtype=dtype, device=device)
+
+            # latents to be fully computed
+            if use_full.any():
+                idx_full = use_full
+                z_full = z[idx_full].to(dtype)
+                pred_full = v_pred_fn(z_full, sigma, idx_full)
+                pred[idx_full] = pred_full.to(dtype)
+
+                # update cache
+                if cached_pred is None:
+                    cached_pred = torch.zeros_like(pred, dtype=dtype, device=device)
+                cached_pred[idx_full] = pred_full.detach().to(dtype)
+
+            # latents to be cached
+            idx_reuse = (~use_full)
+            if idx_reuse.any():
+                if cached_pred is None: # handle abnormality
+                    raise RuntimeError("cached_pred is None but some actions want to reuse cache.")
+                pred[idx_reuse] = cached_pred[idx_reuse]
+
+        if solver == "flow":
+            z, pred_original, log_prob = flow_grpo_step(
+                model_output=pred.float(),
+                latents=z.float(),
+                eta=eta if not determistic else 0,
+                sigmas=sigma_schedule,
+                index=i,
+                prev_sample=None,
+            )
+        elif solver == "dance":
+            z, pred_original, log_prob = dance_grpo_step(
+                pred.float(), z.float(), eta if not determistic else 0, sigmas=sigma_schedule, index=i, prev_sample=None
+            )
+        elif solver == "ddim":
+            z, pred_original, log_prob = ddim_step(
+                pred.float(), z.float(), eta if not determistic else 0, sigmas=sigma_schedule, index=i, prev_sample=None
+            )
+        elif "dpm" in solver:
+            assert determistic
+            z, pred_original, log_prob = dpm_step(
+                order,
+                model_output=pred.float(),
+                sample=z.float(),
+                step_index=i,
+                timesteps=sigma_schedule[:-1],
+                sigmas=sigma_schedule,
+                dpm_state=dpm_state,
+            )
+        else:
+            assert False
+        z = z.to(dtype)
+        all_latents.append(z)
+        all_log_probs.append(log_prob)
+
+    latents = z.to(dtype)
+    # all_latents = torch.stack(all_latents, dim=1)  # (batch_size, num_steps + 1, 4, 64, 64)
+    # all_log_probs = torch.stack(all_log_probs, dim=1)  # (batch_size, num_steps, 1)
+    return latents, all_latents, all_log_probs
 
 def flow_grpo_step(
     model_output: torch.Tensor,

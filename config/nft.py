@@ -17,7 +17,8 @@ def _get_config(base_model="sd3", n_gpus=1, gradient_step_per_epoch=1, dataset="
     # Take FlowGRPO as reference
     if base_model == "sd3":
         config.pretrained.model = "stabilityai/stable-diffusion-3.5-medium"
-        config.sample.num_steps = 10
+        # config.sample.num_steps = 10
+        config.sample.num_steps = 40 # for RL acceleration
         config.sample.eval_num_steps = 40
         config.sample.guidance_scale = 4.5
         config.resolution = 512
@@ -25,6 +26,7 @@ def _get_config(base_model="sd3", n_gpus=1, gradient_step_per_epoch=1, dataset="
         config.sample.noise_level = 0.7
         bsz = 9 # default: 9
         config.sample.num_image_per_prompt = 18 # default: 24
+        num_groups = 48
     elif base_model == "flux":
         config.pretrained.model = "black-forest-labs/FLUX.1-dev"
         config.sample.num_steps = 6
@@ -35,8 +37,8 @@ def _get_config(base_model="sd3", n_gpus=1, gradient_step_per_epoch=1, dataset="
         config.sample.noise_level = 0.8
         bsz = 3 # default: 3
         config.sample.num_image_per_prompt = 6 # default: 24
+        num_groups = 24 # default: 48
 
-    num_groups = 48
 
     # Condition 1: num_groups * config.sample.num_image_per_prompt % (n_gpus * bsz) == 0
     # Condition 2: bsz * n_gpus % config.sample.num_image_per_prompt == 0

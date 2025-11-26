@@ -62,6 +62,7 @@ def get_config():
     config.train = train = ml_collections.ConfigDict()
     # batch size (per GPU!) to use for training.
     train.batch_size = 1
+    train.use_8bit_adam = True
     # learning rate.
     train.learning_rate = 3e-4
     # Adam beta1.

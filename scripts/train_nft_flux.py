@@ -407,19 +407,27 @@ def main(_):
 
     transformer = pipeline.transformer.to(device)
 
+    # configs taken from FlowGRPO
     if config.use_lora:
         target_modules = [
+            "attn.to_k",
+            "attn.to_q",
+            "attn.to_v",
+            "attn.to_out.0",
             "attn.add_k_proj",
             "attn.add_q_proj",
             "attn.add_v_proj",
             "attn.to_add_out",
-            "attn.to_k",
-            "attn.to_out.0",
-            "attn.to_q",
-            "attn.to_v",
+            "ff.net.0.proj",
+            "ff.net.2",
+            "ff_context.net.0.proj",
+            "ff_context.net.2",
         ]
         transformer_lora_config = LoraConfig(
-            r=32, lora_alpha=64, init_lora_weights="gaussian", target_modules=target_modules
+            r=16, # default: 64
+            lora_alpha=32, # default: 128
+            init_lora_weights="gaussian",
+            target_modules=target_modules,
         )
         if config.train.lora_path:
             transformer = PeftModel.from_pretrained(transformer, config.train.lora_path)
@@ -440,7 +448,17 @@ def main(_):
         torch.backends.cudnn.allow_tf32 = True
 
     # --- Optimizer ---
-    optimizer_cls = torch.optim.AdamW
+    if config.train.use_8bit_adam:
+        try:
+            import bitsandbytes as bnb
+        except ImportError:
+            raise ImportError(
+                "Please install bitsandbytes to use 8-bit Adam. You can do so by running `pip install bitsandbytes`"
+            )
+
+        optimizer_cls = bnb.optim.AdamW8bit
+    else:
+        optimizer_cls = torch.optim.AdamW
 
     optimizer = optimizer_cls(
         transformer_trainable_parameters,  # Use params from original model for optimizer
@@ -468,6 +486,7 @@ def main(_):
         rank=rank,
         seed=config.seed,
     )
+    # by default num_workers=0: 猜测是为了让异步的奖励计算能够正常进行
     train_dataloader = DataLoader(
         train_dataset, batch_sampler=train_sampler, num_workers=0, collate_fn=train_dataset.collate_fn, pin_memory=True
     )
@@ -663,8 +682,8 @@ def main(_):
                     "prompt_ids": prompt_ids,
                     "prompt_embeds": prompt_embeds,
                     "pooled_prompt_embeds": pooled_prompt_embeds,
-                    # "image_ids": image_ids,
-                    # "text_ids": text_ids,
+                    "image_ids": image_ids,
+                    "text_ids": text_ids,
                     "timesteps": timesteps,
                     "next_timesteps": torch.concatenate([timesteps[:, 1:], torch.zeros_like(timesteps[:, :1])], dim=1),
                     "latents_clean": latents[:, -1],
@@ -723,6 +742,7 @@ def main(_):
                     },
                     step=global_step,
                 )
+
         collated_samples["rewards"]["avg"] = (
             collated_samples["rewards"]["avg"].unsqueeze(1).repeat(1, num_train_timesteps)
         )
@@ -812,7 +832,14 @@ def main(_):
         # sample复用（如果有的话）
         for inner_epoch in range(config.train.num_inner_epochs):
             perm = torch.randperm(total_batch_size_filtered, device=device)
-            shuffled_filtered_samples = {k: v[perm] for k, v in filtered_samples.items()}
+            static_sample_keys = {"image_ids", "text_ids"}
+
+            shuffled_filtered_samples = {}
+            for k, v in filtered_samples.items():
+                if k in static_sample_keys:
+                    shuffled_filtered_samples[k] = v
+                else:
+                    shuffled_filtered_samples[k] = v[perm]
 
             perms_time = torch.stack(
                 [torch.randperm(num_timesteps_filtered, device=device) for _ in range(total_batch_size_filtered)]
@@ -830,7 +857,10 @@ def main(_):
                 start = k_batch * training_batch_size
                 end = (k_batch + 1) * training_batch_size
                 for key, val_tensor in shuffled_filtered_samples.items():
-                    batch_dict[key] = val_tensor[start:end]
+                    if key in static_sample_keys:
+                        batch_dict[key] = val_tensor
+                    else:
+                        batch_dict[key] = val_tensor[start:end]
                 samples_batched_list.append(batch_dict)
 
             info_accumulated = defaultdict(list)  # For accumulating stats over one grad acc cycle
@@ -908,9 +938,6 @@ def main(_):
                         transformer_ddp.module.set_adapter("old")
                         with torch.no_grad():
                             # prediction v
-                            print(xt.shape)
-                            print(img_ids).shape
-                            print(txt_ids).shape
                             old_prediction = transformer_ddp(
                                 hidden_states=xt,
                                 timestep=train_sample_batch["timesteps"][:, j_idx],

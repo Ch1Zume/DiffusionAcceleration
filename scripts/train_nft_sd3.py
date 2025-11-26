@@ -593,8 +593,8 @@ def main(_):
             train_sampler.set_epoch(epoch)
 
         # SAMPLING, forward rollout
-        if is_main_process(rank):
-            start_time = time.perf_counter()
+        # if is_main_process(rank):
+        #     start_time = time.perf_counter()
         pipeline.transformer.eval()
         samples_data_list = []
 
