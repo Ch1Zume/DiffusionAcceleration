@@ -36,8 +36,8 @@ def _get_config(base_model="sd3", n_gpus=1, gradient_step_per_epoch=1, dataset="
         config.train.beta = 0.0001
         config.sample.noise_level = 0.8
         bsz = 3 # default: 3
-        config.sample.num_image_per_prompt = 6 # default: 24
-        num_groups = 24 # default: 48
+        config.sample.num_image_per_prompt = 3 # default: 24
+        num_groups = 2 # default: 48
 
 
     # Condition 1: num_groups * config.sample.num_image_per_prompt % (n_gpus * bsz) == 0

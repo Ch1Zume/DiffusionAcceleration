@@ -819,6 +819,7 @@ def main(_):
         total_batch_size_filtered, num_timesteps_filtered = filtered_samples["timesteps"].shape
 
         # ======================================= TRAINING ==================================
+        # 两张A100 80G爆显存了
         # if is_main_process(rank):
         #     start_time = time.perf_counter()
         transformer_ddp.train()  # Sets DDP model and its submodules to train mode.
