@@ -106,4 +106,13 @@ def get_config():
     ###### Per-Prompt Stat Tracking ######
     config.per_prompt_stat_tracking = True
 
+    ###### Regarding Policy Network ######
+    config.ACTIONS = {
+        "full": 0,
+        "cache": 1,
+        }
+    config.hidden_dim = 32
+    config.init_full_compute = 0.8
+    config.log_interval = 3
+
     return config

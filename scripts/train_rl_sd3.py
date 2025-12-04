@@ -149,6 +149,22 @@ def compute_text_embeddings(prompt, text_encoders, tokenizers, max_sequence_leng
         pooled_prompt_embeds = pooled_prompt_embeds.to(device)
     return prompt_embeds, pooled_prompt_embeds
 
+def save_image(img_tensor, filename):
+    """
+    img_tensor: [C,H,W], 值域 0~1 或 0~255 均可
+    filename: 保存路径，例如 "output.png"
+    """
+    img = img_tensor.detach().cpu().numpy()
+
+    # 如果是 0~1，转成 0~255
+    if img.max() <= 1.0:
+        img = img * 255
+
+    img = img.astype(np.uint8)
+    img = np.transpose(img, (1, 2, 0))  # CHW -> HWC
+
+    Image.fromarray(img).save(filename)
+
 def eval_fn(
     pipeline,
     test_dataloader,
@@ -206,7 +222,7 @@ def eval_fn(
 
         with torch_autocast(enabled=(config.mixed_precision in ["fp16", "bf16"]), dtype=mixed_precision_dtype):
             with torch.no_grad():
-                images, _, _ = pipeline_with_logprob(
+                images, _, _, _ = pipeline_with_logprob(
                     pipeline,
                     prompt_embeds=prompt_embeds,
                     pooled_prompt_embeds=pooled_prompt_embeds,
@@ -305,6 +321,7 @@ def main(_):
 
     # --- Load pipeline and models ---
     pipeline = StableDiffusion3Pipeline.from_pretrained(config.pretrained.model)
+    logger.info("***** Model Initialized *****")
     # target_modules = [
     #         "attn.add_k_proj",
     #         "attn.add_q_proj",
@@ -322,6 +339,7 @@ def main(_):
     pipeline.transformer = pipeline.transformer.merge_and_unload()
     pipeline.transformer.eval()
     pipeline.transformer.to(device, dtype=mixed_precision_dtype)
+    logger.info("***** Pre-trained Model Loaded *****")
 
     pipeline.vae.requires_grad_(False)
     pipeline.text_encoder.requires_grad_(False)
@@ -350,7 +368,18 @@ def main(_):
     # DDP is not needed when a module doesn't have any parameter that requires a gradient.
     # transformer_ddp = DDP(transformer, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
 
-    acceleration_policy = Policy(T=config.sample.num_steps).to(device)
+    if config.base_model == 'sd3':
+        num_channels_latents = pipeline.transformer.config.in_channels
+    else:
+        num_channels_latents = pipeline.transformer.config.in_channels // 4
+
+    acceleration_policy = Policy(
+        T = config.sample.num_steps,
+        num_actions = len(config.ACTIONS),
+        latent_channel = num_channels_latents,
+        hidden_dim = config.hidden_dim,
+        init_p = config.init_full_compute,
+        ).to(device)
     acceleration_policy_ddp = DDP(acceleration_policy, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
     policy_trainable_parameters = list(filter(lambda p: p.requires_grad, acceleration_policy_ddp.module.parameters()))
 
@@ -358,7 +387,17 @@ def main(_):
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
 
-    optimizer_cls = torch.optim.AdamW
+    if config.train.use_8bit_adam:
+        try:
+            import bitsandbytes as bnb
+        except ImportError:
+            raise ImportError(
+                "Please install bitsandbytes to use 8-bit Adam. You can do so by running `pip install bitsandbytes`"
+            )
+
+        optimizer_cls = bnb.optim.AdamW8bit
+    else:
+        optimizer_cls = torch.optim.AdamW
 
     optimizer = optimizer_cls(
         policy_trainable_parameters,  # Use params from original model for optimizer
@@ -474,11 +513,11 @@ def main(_):
             
             with torch_autocast(enabled=enable_amp, dtype=mixed_precision_dtype):
                 with torch.no_grad():
-                    if is_main_process(rank) and global_step % 10 == 0:
+                    if is_main_process(rank) and global_step % config.log_interval == 0:
                         start_time = time.perf_counter()
 
                     # inference with full compute policy
-                    images, latents, _ = pipeline_with_logprob(
+                    images, latents, _, prepared_latents = pipeline_with_logprob(
                         pipeline,
                         prompt_embeds=prompt_embeds,
                         pooled_prompt_embeds=pooled_prompt_embeds,
@@ -495,7 +534,7 @@ def main(_):
                         model_type="sd3",
                     )
 
-                    if is_main_process(rank) and global_step % 10 == 0:
+                    if is_main_process(rank) and global_step % config.log_interval == 0:
                         end_time_full = time.perf_counter()
             
                     # inference with policy with cache
@@ -515,11 +554,17 @@ def main(_):
                         solver=config.sample.solver,
                         model_type="sd3",
                         acceleration_policy=acceleration_policy_ddp.module,
+                        actions=config.ACTIONS,
+                        latents = prepared_latents, # using same initialization
                     )
+
+                    # if is_main_process(rank):
+                    #     save_image(images[0], '/work/SJTU/DiffusionAcceleration/test_outputs/original_output.png')
+                    #     save_image(images_accelerated[0], '/work/SJTU/DiffusionAcceleration/test_outputs/cached_output.png')
 
                     # print(num_full_steps)
 
-                    if is_main_process(rank) and global_step % 10 == 0:
+                    if is_main_process(rank) and global_step % config.log_interval == 0:
                         end_time_accel = time.perf_counter()
 
                         t_full = end_time_full - start_time
@@ -558,6 +603,7 @@ def main(_):
             R_threshold = R_full * (1 - delta)
 
             reward_speedup = num_full_steps.float() / float(config.sample.num_steps)
+            reward_speedup = reward_speedup.squeeze(-1)
 
             mask_bad  = R_accelerated < R_threshold 
             mask_good = ~mask_bad
@@ -570,6 +616,8 @@ def main(_):
             reward_final[mask_bad] = R_accelerated[mask_bad] - alpha * (R_threshold[mask_bad] - R_accelerated[mask_bad])
 
             # if image quality is above threshold → encourage acceleration
+            # print(R_accelerated)
+            # print(reward_speedup)
             reward_final[mask_good] = R_accelerated[mask_good] + beta * reward_speedup[mask_good]
 
             # TODO: Apply scaler
@@ -581,7 +629,7 @@ def main(_):
             loss_policy_acceleration.backward()
             optimizer.step()
 
-            if is_main_process(rank):
+            if is_main_process(rank) and global_step % config.log_interval == 0:
                 wandb.log(
                     {
                         "train/[Quality]Q_full_quality": R_full.mean().item(),

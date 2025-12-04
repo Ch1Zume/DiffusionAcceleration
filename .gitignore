@@ -316,3 +316,4 @@ HPSv2
 
 *.err
 reward_ckpts/
+test_outputs/

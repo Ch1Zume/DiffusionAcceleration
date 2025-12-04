@@ -34,6 +34,7 @@ def run_sampling(
     ):
         sigma = sigma_schedule[i]
 
+        # print(z.shape)
         pred = v_pred_fn(z.to(dtype), sigma)
         if solver == "flow":
             z, pred_original, log_prob = flow_grpo_step(
@@ -81,13 +82,15 @@ def run_sampling_cached(
     solver="flow",
     determistic=False,
     eta=0.7,
-    cache_actions=None,
+    acceleration_policy=None,
+    actions=None,
 ):
     """
+    z: latents
     sigma: predicted noise
     cache_actions:
         - None: same as full compute
-        - Tensor: 1-full compute; 0-cache; decide for every single timestep
+        - Tensor: 0-full compute; 1-cache; decide for every single timestep
     """
     assert solver in ["flow", "dance", "ddim", "dpm1", "dpm2"]
     dtype = z.dtype
@@ -98,32 +101,19 @@ def run_sampling_cached(
     num_steps = len(sigma_schedule) - 1
     batch_size = z.shape[0]
 
-    # cache_actions: [batch_size, nums_timestep]
-    if cache_actions is not None:
-        cache_actions = cache_actions.to(device)
-        if cache_actions.dim() != 2:
-            raise ValueError("cache_actions must be 2D (steps x batch or batch x steps)")
-
-        if cache_actions.shape[0] == batch_size and cache_actions.shape[1] == num_steps:
-            cache_actions = cache_actions.transpose(0, 1)
-        elif cache_actions.shape[0] == num_steps and cache_actions.shape[1] == batch_size:
-            pass
-        else:
-            raise ValueError(
-                f"cache_actions shape mismatch: got {tuple(cache_actions.shape)}, "
-                f"expected (num_steps={num_steps}, B={batch_size}) or (B, num_steps)"
-            )
-
-        # Convert into bool values
-        cache_actions = cache_actions.bool()
-
     # store cache
     cached_pred = None
+    # timesteps to last full compute (in positive integer) or cache (in negative integer), using abs value
+    dis = 0
+    distance = torch.full((batch_size,), dis, device=device, dtype=dtype)
+    num_full_steps = torch.full((batch_size, 1), 0, device=device, dtype=dtype)
 
     if "dpm" in solver:
         order = int(solver[-1])
         dpm_state = DPMState(order=order)
 
+    # ====================== Predict actions one at a timestep ======================
+    # loop over the timesteps
     for i in tqdm(
         range(num_steps),
         desc="Sampling Progress (cached)",
@@ -131,33 +121,61 @@ def run_sampling_cached(
     ):
         sigma = sigma_schedule[i]
 
-        if cache_actions is None: # full compute
-            pred = v_pred_fn(z.to(dtype), sigma)
-            cached_pred = pred.detach()
-        else: # use cache
-            use_full = cache_actions[i]
+        # sample actions
+        # log_probs = logΠ_θ(a_t | s_t); Π_θ: policy network, a_t: full compute or cache, s_t: timestep, latents, ...
+        t = torch.full((batch_size,), i, device=device, dtype=dtype)
+        
+        # z: [9, 16, 64, 64]-[batch_size, latent_channel, H, W]
+        # returned action is an integer denoting the action idx
+        # 0: full compute; 1: cache; 2: skip; 3: dynamic resolution ...
+        # The training loop wraps sampling in no_grad for the diffusion model; re-enable grads
+        # here so the policy receives gradients from the log-prob term.
+        with torch.enable_grad():
+            action, policy_log_probs = acceleration_policy.sample_action(actions, t, z, distance)
 
-            pred = torch.empty_like(z, dtype=dtype, device=device)
+        # action: [B, 1]
+        # proceed action in batch manner using mask
+        full_mask  = (action == actions['full'])
+        cache_mask = (action == actions['cache'])
 
-            # latents to be fully computed
-            if use_full.any():
-                idx_full = use_full
-                z_full = z[idx_full].to(dtype)
-                pred_full = v_pred_fn(z_full, sigma, idx_full)
-                pred[idx_full] = pred_full.to(dtype)
+        pred = torch.empty_like(z, dtype=dtype, device=z.device)
 
-                # update cache
-                if cached_pred is None:
-                    cached_pred = torch.zeros_like(pred, dtype=dtype, device=device)
-                cached_pred[idx_full] = pred_full.detach().to(dtype)
+        # full compute
+        if full_mask.any():
+            z_full = z[full_mask]                             # [B_full, C, H, W]
+            # print(z_full.shape)
+            pred_full = v_pred_fn(z_full.to(dtype), sigma, full_mask)    # [B_full, C, H, W]
 
-            # latents to be cached
-            idx_reuse = (~use_full)
-            if idx_reuse.any():
-                if cached_pred is None: # handle abnormality
-                    raise RuntimeError("cached_pred is None but some actions want to reuse cache.")
-                pred[idx_reuse] = cached_pred[idx_reuse]
+            pred[full_mask] = pred_full.to(pred.dtype)
 
+            # 初始化 cached_pred（第一次时）
+            if cached_pred is None:
+                cached_pred = torch.zeros_like(pred, dtype=pred.dtype, device=pred.device)
+
+            # 只更新 full 的那部分 cache
+            cached_pred[full_mask] = pred_full.detach().to(cached_pred.dtype)
+
+            # distance 更新：distance > 0 则 +1，否则置为 1
+            # distance: [B]
+            distance_pos = distance.clone()
+            distance_pos[full_mask & (distance > 0)] += 1
+            distance_pos[full_mask & (distance <= 0)] = 1
+            distance = distance_pos
+
+            num_full_steps[full_mask] += 1
+
+        # cache
+        if cache_mask.any():
+            pred[cache_mask] = cached_pred[cache_mask]
+
+            distance_neg = distance.clone()
+            distance_neg[cache_mask & (distance < 0)] -= 1
+            distance_neg[cache_mask & (distance >= 0)] = -1
+            distance = distance_neg
+
+        # TODO: add more actions
+
+        # Note: latent z is updated below as the solver output
         if solver == "flow":
             z, pred_original, log_prob = flow_grpo_step(
                 model_output=pred.float(),
@@ -195,7 +213,7 @@ def run_sampling_cached(
     latents = z.to(dtype)
     # all_latents = torch.stack(all_latents, dim=1)  # (batch_size, num_steps + 1, 4, 64, 64)
     # all_log_probs = torch.stack(all_log_probs, dim=1)  # (batch_size, num_steps, 1)
-    return latents, all_latents, all_log_probs
+    return latents, all_latents, all_log_probs, policy_log_probs, num_full_steps
 
 def flow_grpo_step(
     model_output: torch.Tensor,

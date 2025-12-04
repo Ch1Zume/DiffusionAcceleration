@@ -196,6 +196,7 @@ def pipeline_with_logprob(
     # 4. Prepare latent variables
     if not flux:
         num_channels_latents = self.transformer.config.in_channels
+        # if latents is None, randomly initialize noise
         latents = self.prepare_latents(
             batch_size * num_images_per_prompt,
             num_channels_latents,
@@ -295,6 +296,7 @@ def pipeline_with_logprob(
     # 6. Prepare image embeddings
     all_latents = [latents]
     all_log_probs = []
+    prepared_latents = latents
 
     # 7. Denoising loop
     latents, all_latents, all_log_probs = run_sampling(v_pred_fn, latents, sigmas, solver, deterministic, noise_level)
@@ -310,10 +312,11 @@ def pipeline_with_logprob(
     self.maybe_free_model_hooks()
 
     if not flux:
-        return image, all_latents, all_log_probs
+        return image, all_latents, all_log_probs, prepared_latents
     else:
-        return image, all_latents, latent_image_ids, text_ids, all_log_probs
+        return image, all_latents, latent_image_ids, text_ids, all_log_probs, prepared_latents
 
+# =========================================================== Pipeline with cache ===========================================================
 @torch.no_grad()
 def pipeline_with_logprob_cached(
     self,
@@ -343,6 +346,7 @@ def pipeline_with_logprob_cached(
     solver: str = "flow",
     model_type: str = "sd3",
     acceleration_policy = None,
+    actions = None,
 ):
     height = height or self.default_sample_size * self.vae_scale_factor
     width = width or self.default_sample_size * self.vae_scale_factor
@@ -499,57 +503,23 @@ def pipeline_with_logprob_cached(
 
     sigmas = self.scheduler.sigmas.float()
 
-    # 6. Determine cache actions
-    # 后续可能考虑使用AMP，现在policy network不大，可以先不用
-    with torch.enable_grad():
-        cache_actions = None
-        acceleration_policy_log_probs = None
-
-        if acceleration_policy is not None:
-            num_steps = len(sigmas) - 1
-            batch_size = latents.shape[0]
-            device = latents.device
-
-            cache_actions_list = []
-            acceleration_policy_log_probs_list = []
-
-            for step_idx in range(num_steps):
-                # build a tensor of shape [batch_size,] with all elements = step_idx
-                t_indices = torch.full((batch_size,), step_idx, device=device, dtype=torch.long)
-                sigma_t = sigmas[step_idx]
-                sigma_batch = torch.full((batch_size,), sigma_t, device=device, dtype=torch.float32)
-                # log_probs = logΠ_θ(a_t | s_t); Π_θ: policy network, a_t: full compute or cache, s_t: timestep, latents, ...
-                actions, log_probs = acceleration_policy.sample_action(t_indices, sigma_batch)
-                cache_actions_list.append(actions.unsqueeze(0))
-                acceleration_policy_log_probs_list.append(log_probs.unsqueeze(0))
-
-            # [num_steps, batch_size]
-            cache_actions = torch.cat(cache_actions_list, dim=0)
-            # first step must be full compute
-            cache_actions[0, :] = 1
-            acceleration_policy_log_probs = torch.cat(acceleration_policy_log_probs_list, dim=0)
-
-            # note we use 1 to represent full compute
-            num_full_steps = cache_actions.sum(dim=0)
-        else:
-            cache_actions = None
-            acceleration_policy_log_probs = None
-            num_full_steps = None
-
-    def v_pred_fn_cached(z, sigma, sample_mask=None):
+    def v_pred_fn_cached(z, sigma, sample_mask):
         if not flux:
             latent_model_input = torch.cat([z] * 2) if self.do_classifier_free_guidance else z
             # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
             timesteps = torch.full([latent_model_input.shape[0]], sigma * 1000, device=z.device, dtype=torch.long)
             # if cache is used, the text embedding dim required for full compute will change, so we have to modify the input dim
-            prompt_embeds_local, pooled_prompt_embeds_local = _select_conditioning_tensors(
-                prompt_embeds, pooled_prompt_embeds, sample_mask, self.do_classifier_free_guidance
+            prompt_embeds_cached, pooled_prompt_embeds_cached = _select_conditioning_tensors(
+                prompt_embeds,
+                pooled_prompt_embeds,
+                sample_mask,              
+                self.do_classifier_free_guidance,
             )
             noise_pred = self.transformer(
                 hidden_states=latent_model_input,
                 timestep=timesteps,
-                encoder_hidden_states=prompt_embeds_local,
-                pooled_projections=pooled_prompt_embeds_local,
+                encoder_hidden_states=prompt_embeds_cached,
+                pooled_projections=pooled_prompt_embeds_cached,
                 joint_attention_kwargs=self.joint_attention_kwargs,
                 return_dict=False,
             )[0]
@@ -568,17 +538,36 @@ def pipeline_with_logprob_cached(
                 guidance = None
             # timesteps = torch.full([latent_model_input.shape[0]], sigma, device=z.device, dtype=torch.long)
             timesteps = torch.full([latent_model_input.shape[0]], sigma, device=z.device, dtype=torch.float32)
-            prompt_embeds_local, pooled_prompt_embeds_local = _select_conditioning_tensors(
-                prompt_embeds, pooled_prompt_embeds, sample_mask, False
+            # if cache is used, the text embedding dim required for full compute will change, so we have to modify the input dim
+            prompt_embeds_cached, pooled_prompt_embeds_cached = _select_conditioning_tensors(
+                prompt_embeds,
+                pooled_prompt_embeds,
+                sample_mask,
+                do_classifier_free_guidance=False,  # Flux一般没有 CFG
             )
+
+            if sample_mask is not None:
+                if not isinstance(sample_mask, torch.Tensor):
+                    sample_mask = torch.as_tensor(sample_mask)
+                if sample_mask.dtype == torch.bool:
+                    sample_indices = torch.nonzero(sample_mask, as_tuple=False).squeeze(-1)
+                else:
+                    sample_indices = sample_mask.to(dtype=torch.long, device=prompt_embeds.device)
+
+                text_ids_cached = text_ids.index_select(0, sample_indices)
+                latent_image_ids_cached = latent_image_ids.index_select(0, sample_indices)
+            else:
+                text_ids_cached = text_ids
+                latent_image_ids_cached = latent_image_ids
+
             noise_pred = self.transformer(
                 hidden_states=latent_model_input,
                 timestep=timesteps,
                 guidance=guidance,
-                pooled_projections=pooled_prompt_embeds_local,
-                encoder_hidden_states=prompt_embeds_local,
-                txt_ids=text_ids,
-                img_ids=latent_image_ids,
+                pooled_projections=pooled_prompt_embeds_cached,
+                encoder_hidden_states=prompt_embeds_cached,
+                txt_ids=text_ids_cached,
+                img_ids=latent_image_ids_cached,
                 joint_attention_kwargs=self.joint_attention_kwargs,
                 return_dict=False,
             )[0]
@@ -589,7 +578,9 @@ def pipeline_with_logprob_cached(
     all_log_probs = []
 
     # 8. Denoising loop with cache actions
-    latents, all_latents, all_log_probs = run_sampling_cached(v_pred_fn_cached, latents, sigmas, solver, deterministic, noise_level, cache_actions)
+    acceleration_policy_log_probs = None
+    num_full_steps = None
+    latents, all_latents, all_log_probs, acceleration_policy_log_probs, num_full_steps = run_sampling_cached(v_pred_fn_cached, latents, sigmas, solver, deterministic, noise_level, acceleration_policy, actions)
 
     if flux:
         latents = self._unpack_latents(latents, height, width, self.vae_scale_factor)
