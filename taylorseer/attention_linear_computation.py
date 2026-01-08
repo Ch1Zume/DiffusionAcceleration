@@ -23,6 +23,7 @@ from diffusers.models.normalization import SD35AdaLayerNormZeroX, AdaLayerNormZe
 from diffusers.utils import logging, deprecate
 from diffusers.utils.torch_utils import maybe_allow_in_graph
 from torch import nn
+from .ts_utils import forecast
 
 # from ..utils import deprecate, logging
 # from ..utils.torch_utils import maybe_allow_in_graph
@@ -200,9 +201,12 @@ class JTBlock(nn.Module):
         encoder_hidden_states: torch.FloatTensor,
         temb: torch.FloatTensor,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
-        cache_dic: Optional[dict] = None,
-        timestep_now:int=0,
-        layer_idx:int=0,
+        use_cache: bool = False,
+        cache_dict: Optional[dict] = None,
+        sample_idx: list = None,
+        current_timestep: int = 0,
+        layer_idx: int = 0,
+        action: int = 0,
     ):
         joint_attention_kwargs = joint_attention_kwargs or {}
         if self.use_dual_attention:
@@ -219,54 +223,385 @@ class JTBlock(nn.Module):
                 encoder_hidden_states, emb=temb
             )
 
-        if cache_dic is None:
-            cache_dic={}
-        if timestep_now not in cache_dic:
-            cache_dic[timestep_now] = {}
-        if layer_idx not in cache_dic[timestep_now]:
-            cache_dic[timestep_now][layer_idx] = {}
+        # ================================================ Cache for Attention layers ================================================
+        t = int(current_timestep)
+        
+        if use_cache:
+            # 统一 sample_idx 为 CPU int，避免同一 batch id 出现 int 与 tensor 两套键导致维度增加
+            sample_idx = [int(b) for b in sample_idx]
 
-        if timestep_now%3!=2:
+            for local_idx, b in enumerate(sample_idx):
+                if b not in cache_dict:
+                    cache_dict[b] = {}
+                if t not in cache_dict[b]:
+                    cache_dict[b][t] = {}
+                if layer_idx not in cache_dict[b][t]:
+                    cache_dict[b][t][layer_idx] = {}
+                sample_wise_cache = cache_dict[b]
+
+                if action == 0: # full compute
+                    attn_output, context_attn_output = self.attn(
+                        hidden_states=norm_hidden_states,
+                        encoder_hidden_states=norm_encoder_hidden_states,
+                        **joint_attention_kwargs,
+                    ) # attn_output: self attention, context_attn_output: cross attention to conditions such as text
+                    sample_wise_cache[t][layer_idx]["attn_output"] = attn_output[local_idx]
+                    sample_wise_cache[t][layer_idx]["context_attn_output"] = context_attn_output[local_idx]
+
+                    # reset distance to full compute
+                    k = 0 
+                else: 
+                    # find keys that stores previous full compute cache
+                    cached_ts = sorted(sample_wise_cache.keys())
+                    prev_ts = [x for x in cached_ts if x < t]
+                    assert len(prev_ts) >= 2, 'Insufficient Cache at Attention'
+                    if t == 5 : # first full compute margin
+                        t_prev2, t_prev1 = prev_ts[0], prev_ts[-1]
+                    else:
+                        t_prev2, t_prev1 = prev_ts[-2], prev_ts[-1]
+                    # margin between last two full compute
+                    N = t_prev1 - t_prev2
+                    # cache for self attn
+                    f_sa_last, f_sa = sample_wise_cache[t_prev2][layer_idx]["attn_output"], sample_wise_cache[t_prev1][layer_idx]["attn_output"]
+                    # cache for cross attn
+                    f_ca_last, f_ca = sample_wise_cache[t_prev2][layer_idx]["context_attn_output"], sample_wise_cache[t_prev1][layer_idx]["context_attn_output"]
+
+                    attn_output = forecast(f_sa, f_sa_last, N, k)
+                    context_attn_output = forecast(f_ca, f_ca_last, N, k)
+
+                    # update distance
+                    k += 1
+        else:
+            # Attention.
             attn_output, context_attn_output = self.attn(
                 hidden_states=norm_hidden_states,
                 encoder_hidden_states=norm_encoder_hidden_states,
                 **joint_attention_kwargs,
             )
-            cache_dic[timestep_now][layer_idx]["attn_output"] = attn_output
-            cache_dic[timestep_now][layer_idx]["context_attn_output"] = context_attn_output
-        else:
-            attn_output=2*cache_dic[timestep_now-1][layer_idx]["attn_output"]-cache_dic[timestep_now-2][layer_idx]["attn_output"]
-            context_attn_output=2*cache_dic[timestep_now-1][layer_idx]["context_attn_output"] -cache_dic[timestep_now-2][layer_idx]["context_attn_output"]
-            # print(attn_output.shape, context_attn_output.shape)
-            # print(timestep_now)
-
 
         # Process attention outputs for the `hidden_states`.
         attn_output = gate_msa.unsqueeze(1) * attn_output
         hidden_states = hidden_states + attn_output
-
+        
         if self.use_dual_attention:
-            if timestep_now%3!=2:
-                attn_output2 = self.attn2(hidden_states=norm_hidden_states2, **joint_attention_kwargs)
-                cache_dic[timestep_now][layer_idx]["attn_output2"] = attn_output2
+            if use_cache:
+                for local_idx, b in enumerate(sample_idx):
+                    sample_wise_cache = cache_dict[b]
+                    if action == 0:
+                        attn_output2 = self.attn2(hidden_states=norm_hidden_states2, **joint_attention_kwargs)
+                        sample_wise_cache[t][layer_idx]["attn_output2"] = attn_output2[local_idx]
+                        k = 0
+                    else:
+                        cached_ts = sorted(sample_wise_cache.keys())
+                        prev_ts = [x for x in cached_ts if x < t]
+                        assert len(prev_ts) >= 2, 'Insufficient Cache at Dual Attention'
+                        if t == 5 :
+                            t_prev2, t_prev1 = prev_ts[0], prev_ts[-1]
+                        else:
+                            t_prev2, t_prev1 = prev_ts[-2], prev_ts[-1]
+                        N = t_prev1 - t_prev2
+                        f_da_last, f_da = sample_wise_cache[t_prev2][layer_idx]["attn_output2"], sample_wise_cache[t_prev1][layer_idx]["attn_output2"]
+
+                        attn_output2 = forecast(f_da, f_da_last, N, k)
+                        k += 1
             else:
-                attn_output2=2*cache_dic[timestep_now-1][layer_idx]["attn_output2"]-cache_dic[timestep_now-2][layer_idx]["attn_output2"]
+                attn_output2 = self.attn2(hidden_states=norm_hidden_states2, **joint_attention_kwargs)
             attn_output2 = gate_msa2.unsqueeze(1) * attn_output2
             hidden_states = hidden_states + attn_output2
 
         norm_hidden_states = self.norm2(hidden_states)
         norm_hidden_states = norm_hidden_states * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
+        # ================================================ Cache for Attention layers ================================================
 
-        if timestep_now%3!=2:
+        # ================================================ Cache for FFN layers ================================================
+        if use_cache:
+            for local_idx, b in enumerate(sample_idx):
+                sample_wise_cache = cache_dict[b]
+                if action == 0:
+                    if self._chunk_size is not None:
+                        # "feed_forward_chunk_size" can be used to save memory
+                        ff_output = _chunked_feed_forward(self.ff, norm_hidden_states, self._chunk_dim, self._chunk_size)
+                    else:
+                        ff_output = self.ff(norm_hidden_states)
+                    sample_wise_cache[t][layer_idx]["ff_output"] = ff_output[local_idx]
+                    k = 0
+                else:
+                    cached_ts = sorted(sample_wise_cache.keys())
+                    prev_ts = [x for x in cached_ts if x < t]
+                    assert len(prev_ts) >= 2, 'Insufficient Cache at FFN'
+                    if t == 5 :
+                        t_prev2, t_prev1 = prev_ts[0], prev_ts[-1]
+                    else:
+                        t_prev2, t_prev1 = prev_ts[-2], prev_ts[-1]
+                    N = t_prev1 - t_prev2
+                    f_ff_last, f_ff = sample_wise_cache[t_prev2][layer_idx]["ff_output"], sample_wise_cache[t_prev1][layer_idx]["ff_output"]
+                    ff_output = forecast(f_ff, f_ff_last, N, k)
+                    k += 1
+        else:
             if self._chunk_size is not None:
                 # "feed_forward_chunk_size" can be used to save memory
                 ff_output = _chunked_feed_forward(self.ff, norm_hidden_states, self._chunk_dim, self._chunk_size)
             else:
                 ff_output = self.ff(norm_hidden_states)
-            cache_dic[timestep_now][layer_idx]["ff_output"] = ff_output
-        else:
-            ff_output=2*cache_dic[timestep_now-1][layer_idx]["ff_output"]-cache_dic[timestep_now-2][layer_idx]["ff_output"]
+        # ================================================ Cache for FFN layers ================================================
 
+        ff_output = gate_mlp.unsqueeze(1) * ff_output
+        hidden_states = hidden_states + ff_output
+
+        # Process attention outputs for the `encoder_hidden_states`.
+        if self.context_pre_only:
+            encoder_hidden_states = None
+        else:
+            context_attn_output = c_gate_msa.unsqueeze(1) * context_attn_output
+            encoder_hidden_states = encoder_hidden_states + context_attn_output
+
+            norm_encoder_hidden_states = self.norm2_context(encoder_hidden_states)
+            norm_encoder_hidden_states = norm_encoder_hidden_states * (1 + c_scale_mlp[:, None]) + c_shift_mlp[:, None]
+            if self._chunk_size is not None:
+                # "feed_forward_chunk_size" can be used to save memory
+                context_ff_output = _chunked_feed_forward(
+                    self.ff_context, norm_encoder_hidden_states, self._chunk_dim, self._chunk_size
+                )
+            else:
+                context_ff_output = self.ff_context(norm_encoder_hidden_states)
+            encoder_hidden_states = encoder_hidden_states + c_gate_mlp.unsqueeze(1) * context_ff_output
+
+        return encoder_hidden_states, hidden_states
+
+@maybe_allow_in_graph
+class JTBlock_Batch(nn.Module):
+    r"""
+    A Transformer block following the MMDiT architecture, introduced in Stable Diffusion 3.
+
+    Reference: https://arxiv.org/abs/2403.03206
+
+    Parameters:
+        dim (`int`): The number of channels in the input and output.
+        num_attention_heads (`int`): The number of heads to use for multi-head attention.
+        attention_head_dim (`int`): The number of channels in each head.
+        context_pre_only (`bool`): Boolean to determine if we should add some blocks associated with the
+            processing of `context` conditions.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        num_attention_heads: int,
+        attention_head_dim: int,
+        context_pre_only: bool = False,
+        qk_norm: Optional[str] = None,
+        use_dual_attention: bool = False,
+    ):
+        super().__init__()
+
+        self.use_dual_attention = use_dual_attention
+        self.context_pre_only = context_pre_only
+        context_norm_type = "ada_norm_continous" if context_pre_only else "ada_norm_zero"
+
+        if use_dual_attention:
+            self.norm1 = SD35AdaLayerNormZeroX(dim)
+        else:
+            self.norm1 = AdaLayerNormZero(dim)
+
+        if context_norm_type == "ada_norm_continous":
+            self.norm1_context = AdaLayerNormContinuous(
+                dim, dim, elementwise_affine=False, eps=1e-6, bias=True, norm_type="layer_norm"
+            )
+        elif context_norm_type == "ada_norm_zero":
+            self.norm1_context = AdaLayerNormZero(dim)
+        else:
+            raise ValueError(
+                f"Unknown context_norm_type: {context_norm_type}, currently only support `ada_norm_continous`, `ada_norm_zero`"
+            )
+
+        if hasattr(F, "scaled_dot_product_attention"):
+            processor = JointAttnProcessor2_0()
+        else:
+            raise ValueError(
+                "The current PyTorch version does not support the `scaled_dot_product_attention` function."
+            )
+
+        self.attn = Attention(
+            query_dim=dim,
+            cross_attention_dim=None,
+            added_kv_proj_dim=dim,
+            dim_head=attention_head_dim,
+            heads=num_attention_heads,
+            out_dim=dim,
+            context_pre_only=context_pre_only,
+            bias=True,
+            processor=processor,
+            qk_norm=qk_norm,
+            eps=1e-6,
+        )
+
+        if use_dual_attention:
+            self.attn2 = Attention(
+                query_dim=dim,
+                cross_attention_dim=None,
+                dim_head=attention_head_dim,
+                heads=num_attention_heads,
+                out_dim=dim,
+                bias=True,
+                processor=processor,
+                qk_norm=qk_norm,
+                eps=1e-6,
+            )
+        else:
+            self.attn2 = None
+
+        self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.ff = FeedForward(dim=dim, dim_out=dim, activation_fn="gelu-approximate")
+
+        if not context_pre_only:
+            self.norm2_context = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+            self.ff_context = FeedForward(dim=dim, dim_out=dim, activation_fn="gelu-approximate")
+        else:
+            self.norm2_context = None
+            self.ff_context = None
+
+        # let chunk size default to None
+        self._chunk_size = None
+        self._chunk_dim = 0
+
+    # Copied from diffusers.models.attention.BasicTransformerBlock.set_chunk_feed_forward
+    def set_chunk_feed_forward(self, chunk_size: Optional[int], dim: int = 0):
+        # Sets chunk feed-forward
+        self._chunk_size = chunk_size
+        self._chunk_dim = dim
+
+    def forward(
+        self,
+        hidden_states: torch.FloatTensor,
+        encoder_hidden_states: torch.FloatTensor,
+        temb: torch.FloatTensor,
+        joint_attention_kwargs: Optional[Dict[str, Any]] = None,
+        use_cache: bool = False,
+        cache_dict: Optional[dict] = None,
+        current_timestep: int = 0,
+        layer_idx: int = 0,
+        action: int = 0,
+    ):
+        joint_attention_kwargs = joint_attention_kwargs or {}
+        if self.use_dual_attention:
+            norm_hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp, norm_hidden_states2, gate_msa2 = self.norm1(
+                hidden_states, emb=temb
+            )
+        else:
+            norm_hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.norm1(hidden_states, emb=temb)
+
+        if self.context_pre_only:
+            norm_encoder_hidden_states = self.norm1_context(encoder_hidden_states, temb)
+        else:
+            norm_encoder_hidden_states, c_gate_msa, c_shift_mlp, c_scale_mlp, c_gate_mlp = self.norm1_context(
+                encoder_hidden_states, emb=temb
+            )
+
+        # ================================================ Cache for Attention layers ================================================
+        t = int(current_timestep)
+        # each sample within the batch share the same action
+        if use_cache:
+            if t not in cache_dict:
+                cache_dict[t] = {}
+            if layer_idx not in cache_dict[t]:
+                cache_dict[t][layer_idx] = {}
+
+            if action == 0: # full compute
+                attn_output, context_attn_output = self.attn(
+                    hidden_states=norm_hidden_states,
+                    encoder_hidden_states=norm_encoder_hidden_states,
+                    **joint_attention_kwargs,
+                ) # attn_output: self attention, context_attn_output: cross attention to conditions such as text
+                cache_dict[t][layer_idx]["attn_output"] = attn_output.detach()
+                cache_dict[t][layer_idx]["context_attn_output"] = context_attn_output.detach()
+            else: 
+                # find keys that store previous *full-compute* cache
+                cached_ts = sorted(cache_dict.keys())
+                full_ts = [x for x in cached_ts if x < t and "attn_output" in cache_dict[x].get(layer_idx, {})] # full timesteps
+                assert len(full_ts) >= 2, 'Insufficient Cache at Attention'
+                if t == 5 : # first full compute margin
+                    t_prev2, t_prev1 = full_ts[0], full_ts[-1]
+                else:
+                    t_prev2, t_prev1 = full_ts[-2], full_ts[-1]
+                # margin between last two full compute
+                N = t_prev1 - t_prev2
+                # distance to last full compute
+                k = t - t_prev1
+                # cache for self attn
+                f_sa_last, f_sa = cache_dict[t_prev2][layer_idx]["attn_output"], cache_dict[t_prev1][layer_idx]["attn_output"]
+                # cache for cross attn
+                f_ca_last, f_ca = cache_dict[t_prev2][layer_idx]["context_attn_output"], cache_dict[t_prev1][layer_idx]["context_attn_output"]
+
+                attn_output = forecast(f_sa, f_sa_last, N, k)
+                context_attn_output = forecast(f_ca, f_ca_last, N, k)
+        else:
+            # Attention.
+            attn_output, context_attn_output = self.attn(
+                hidden_states=norm_hidden_states,
+                encoder_hidden_states=norm_encoder_hidden_states,
+                **joint_attention_kwargs,
+            )
+
+        # Process attention outputs for the `hidden_states`.
+        attn_output = gate_msa.unsqueeze(1) * attn_output
+        hidden_states = hidden_states + attn_output
+        
+        if self.use_dual_attention:
+            if use_cache:
+                if action == 0:
+                    attn_output2 = self.attn2(hidden_states=norm_hidden_states2, **joint_attention_kwargs)
+                    cache_dict[t][layer_idx]["attn_output2"] = attn_output2.detach()
+                else:
+                    cached_ts = sorted(cache_dict.keys())
+                    full_ts = [x for x in cached_ts if x < t and "attn_output2" in cache_dict[x].get(layer_idx, {})]
+                    assert len(full_ts) >= 2, 'Insufficient Cache at Dual Attention'
+                    if t == 5 :
+                        t_prev2, t_prev1 = full_ts[0], full_ts[-1]
+                    else:
+                        t_prev2, t_prev1 = full_ts[-2], full_ts[-1]
+                    N = t_prev1 - t_prev2
+                    k = t - t_prev1
+                    f_da_last, f_da = cache_dict[t_prev2][layer_idx]["attn_output2"], cache_dict[t_prev1][layer_idx]["attn_output2"]
+
+                    attn_output2 = forecast(f_da, f_da_last, N, k)
+            else:
+                attn_output2 = self.attn2(hidden_states=norm_hidden_states2, **joint_attention_kwargs)
+                
+            attn_output2 = gate_msa2.unsqueeze(1) * attn_output2
+            hidden_states = hidden_states + attn_output2
+
+        norm_hidden_states = self.norm2(hidden_states)
+        norm_hidden_states = norm_hidden_states * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
+        # ================================================ Cache for Attention layers ================================================
+
+        # ================================================ Cache for FFN layers ================================================
+        if use_cache:
+            if action == 0:
+                if self._chunk_size is not None:
+                    # "feed_forward_chunk_size" can be used to save memory
+                    ff_output = _chunked_feed_forward(self.ff, norm_hidden_states, self._chunk_dim, self._chunk_size)
+                else:
+                    ff_output = self.ff(norm_hidden_states)
+                cache_dict[t][layer_idx]["ff_output"] = ff_output.detach()
+            else:
+                cached_ts = sorted(cache_dict.keys())
+                full_ts = [x for x in cached_ts if x < t and "ff_output" in cache_dict[x].get(layer_idx, {})]
+                assert len(full_ts) >= 2, 'Insufficient Cache at FFN'
+                if t == 5 :
+                    t_prev2, t_prev1 = full_ts[0], full_ts[-1]
+                else:
+                    t_prev2, t_prev1 = full_ts[-2], full_ts[-1]
+                N = t_prev1 - t_prev2
+                k = t - t_prev1
+                f_ff_last, f_ff = cache_dict[t_prev2][layer_idx]["ff_output"], cache_dict[t_prev1][layer_idx]["ff_output"]
+                ff_output = forecast(f_ff, f_ff_last, N, k)
+        else:
+            if self._chunk_size is not None:
+                # "feed_forward_chunk_size" can be used to save memory
+                ff_output = _chunked_feed_forward(self.ff, norm_hidden_states, self._chunk_dim, self._chunk_size)
+            else:
+                ff_output = self.ff(norm_hidden_states)
+        # ================================================ Cache for FFN layers ================================================
 
         ff_output = gate_mlp.unsqueeze(1) * ff_output
         hidden_states = hidden_states + ff_output

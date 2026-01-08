@@ -1,5 +1,7 @@
 from collections import defaultdict
 import os
+import sys
+import math
 import datetime
 from concurrent import futures
 import time
@@ -9,9 +11,10 @@ import logging
 from diffusers import StableDiffusion3Pipeline
 import numpy as np
 from regex import R
+from torch.cuda import device_count
 import flow_grpo.rewards
 from flow_grpo.stat_tracking import PerPromptStatTracker
-from flow_grpo.diffusers_patch.pipeline_with_logprob import pipeline_with_logprob, pipeline_with_logprob_cached
+from flow_grpo.diffusers_patch.pipeline_with_logprob import pipeline_with_logprob, pipeline_with_logprob_layerwise_cache, pipeline_with_logprob_layerwise_cache_batch
 from flow_grpo.diffusers_patch.train_dreambooth_lora_sd3 import encode_prompt
 import torch
 import torch.distributed as dist
@@ -28,7 +31,8 @@ from torch.utils.data import Dataset, DataLoader, Sampler
 from flow_grpo.ema import EMAModuleWrapper
 from ml_collections import config_flags
 from torch.cuda.amp import GradScaler, autocast as torch_autocast
-from modules.policy import Policy
+from modules.policy import Policy, save_policy, load_policy
+from taylorseer.Custom_DiT_linear import SD3Transformer2DModel_Taylor
 
 tqdm = partial(tqdm.tqdm, dynamic_ncols=True)
 
@@ -174,6 +178,7 @@ def eval_fn(
     device,
     rank,
     world_size,
+    global_step,
     reward_fn,
     executor,
     mixed_precision_dtype,
@@ -238,6 +243,8 @@ def eval_fn(
                     solver="flow",
                     model_type="sd3",
                 )
+        if is_main_process(rank):
+            save_image(images[0], '/work/SJTU/DiffusionAcceleration/test_outputs/eval_output.png')
 
         rewards_future = executor.submit(reward_fn, images, prompts, prompt_metadata, only_strict=False)
         time.sleep(0)
@@ -277,7 +284,7 @@ def eval_fn(
                     ],
                     **{f"eval_reward_{key}": np.mean(value[value != -10]) for key, value in final_rewards.items()},
                 },
-                step=1,
+                step=global_step,
             )
 
     if world_size > 1:
@@ -305,7 +312,8 @@ def main(_):
         log_dir = os.path.join(config.logdir, config.run_name)
         os.makedirs(log_dir, exist_ok=True)
         wandb.init(project="flow-grpo", name=config.run_name, config=config.to_dict(), dir=log_dir)
-    logger.info(f"\n{config}")
+    if is_main_process(rank):
+        logger.info(f"\n{config}")
 
     set_seed(config.seed, rank)  # Pass rank for different seeds per process
 
@@ -320,26 +328,38 @@ def main(_):
     # scaler = GradScaler(enabled=enable_amp)
 
     # --- Load pipeline and models ---
-    pipeline = StableDiffusion3Pipeline.from_pretrained(config.pretrained.model)
-    logger.info("***** Model Initialized *****")
-    # target_modules = [
-    #         "attn.add_k_proj",
-    #         "attn.add_q_proj",
-    #         "attn.add_v_proj",
-    #         "attn.to_add_out",
-    #         "attn.to_k",
-    #         "attn.to_out.0",
-    #         "attn.to_q",
-    #         "attn.to_v",
-    #     ]
-    # transformer_lora_config = LoraConfig(
-    #     r=32, lora_alpha=64, init_lora_weights="gaussian", target_modules=target_modules
-    # )
-    pipeline.transformer = PeftModel.from_pretrained(pipeline.transformer, "jieliu/SD3.5M-FlowGRPO-GenEval")
-    pipeline.transformer = pipeline.transformer.merge_and_unload()
-    pipeline.transformer.eval()
-    pipeline.transformer.to(device, dtype=mixed_precision_dtype)
-    logger.info("***** Pre-trained Model Loaded *****")
+    pipeline = StableDiffusion3Pipeline.from_pretrained(config.pretrained.model, torch_dtype=mixed_precision_dtype)
+    pipeline = pipeline.to(device) 
+    # test_prompt = 'a sideview of a red colored car.'
+    # with torch_autocast(enabled=enable_amp, dtype=mixed_precision_dtype):
+    #     image = pipeline(
+    #         prompt=test_prompt,
+    #         negative_prompt="",
+    #         height=config.resolution, 
+    #         width=config.resolution, 
+    #         num_inference_steps=config.sample.num_steps, 
+    #         guidance_scale=config.sample.guidance_scale,
+    #     ).images[0]
+    # image.save(f"test_outputs/official_output_initialized.png")
+    if is_main_process(rank):
+        logger.info("***** Model Initialized *****")
+
+    # with cache
+    base_transformer = pipeline.transformer
+    config_dict = pipeline.transformer.config
+    new_transformer = SD3Transformer2DModel_Taylor.from_config(config_dict)
+    new_transformer.load_state_dict(base_transformer.state_dict())
+    new_transformer = PeftModel.from_pretrained(new_transformer, "jieliu/SD3.5M-FlowGRPO-GenEval").merge_and_unload()
+    pipeline.transformer = new_transformer.to(device, dtype=mixed_precision_dtype).eval()
+    pipeline.to(device)
+    if is_main_process(rank):
+        logger.info("***** Transformer with TaylorSeer Loaded *****")
+
+    # without cache
+    # pipeline.transformer = PeftModel.from_pretrained(pipeline.transformer, "jieliu/SD3.5M-FlowGRPO-GenEval")
+    # pipeline.transformer = pipeline.transformer.merge_and_unload()
+    # pipeline.transformer.eval()
+    # pipeline = pipeline.to(device)
 
     pipeline.vae.requires_grad_(False)
     pipeline.text_encoder.requires_grad_(False)
@@ -373,13 +393,62 @@ def main(_):
     else:
         num_channels_latents = pipeline.transformer.config.in_channels // 4
 
-    acceleration_policy = Policy(
-        T = config.sample.num_steps,
-        num_actions = len(config.ACTIONS),
-        latent_channel = num_channels_latents,
-        hidden_dim = config.hidden_dim,
-        init_p = config.init_full_compute,
-        ).to(device)
+    # =================================================== Pretrained model test ===================================================
+    # Official way from diffuser
+    # with torch_autocast(enabled=enable_amp, dtype=mixed_precision_dtype):
+    #     image = pipeline(
+    #         prompt=test_prompt,
+    #         negative_prompt="",
+    #         height=config.resolution, 
+    #         width=config.resolution, 
+    #         num_inference_steps=config.sample.num_steps, 
+    #         guidance_scale=config.sample.guidance_scale,
+    #         ).images[0]  
+    # image.save(f"test_outputs/official_output_pretrained.png")
+    # sys.exit()
+
+    # Pipeline with logprob
+    # prompt_embeds, pooled_prompt_embeds = compute_text_embeddings(
+    #     [test_prompt], text_encoders, tokenizers, max_sequence_length=128, device=device
+    # )
+    # neg_prompt_embed, neg_pooled_prompt_embed = compute_text_embeddings(
+    #     [""], text_encoders, tokenizers, max_sequence_length=128, device=device
+    # )
+    # with torch_autocast(enabled=enable_amp, dtype=mixed_precision_dtype):
+    #     with torch.no_grad():
+    #         images, _, _, _ = pipeline_with_logprob(
+    #             pipeline,
+    #             prompt_embeds=prompt_embeds,
+    #             pooled_prompt_embeds=pooled_prompt_embeds,
+    #             negative_prompt_embeds=neg_prompt_embed,
+    #             negative_pooled_prompt_embeds=neg_pooled_prompt_embed,
+    #             num_inference_steps=config.sample.num_steps,
+    #             guidance_scale=config.sample.guidance_scale,
+    #             output_type="pt",
+    #             height=config.resolution,
+    #             width=config.resolution,
+    #             noise_level=config.sample.noise_level,
+    #             deterministic=config.sample.deterministic,
+    #             solver=config.sample.solver,
+    #             model_type="sd3",
+    #         )
+    # save_image(images[0], 'test_outputs/nft_output.png')
+    # logger.info("***** Pretrained Model Test Finished *****")
+    # sys.exit()
+    # =================================================== Pretrained model test ===================================================
+
+    if config.sft: # initialization and SFT
+        acceleration_policy = Policy(
+            T = config.sample.num_steps,
+            num_actions = len(config.ACTIONS),
+            latent_channel = num_channels_latents,
+            hidden_dim = config.hidden_dim,
+            ).to(device)
+    else: # load pretrained network
+        acceleration_policy = load_policy('ckpt_policy/0.7_180.pt').to(device)
+    if is_main_process(rank):
+        logger.info("***** Pre-trained Policy Network Loaded *****")
+
     acceleration_policy_ddp = DDP(acceleration_policy, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
     policy_trainable_parameters = list(filter(lambda p: p.requires_grad, acceleration_policy_ddp.module.parameters()))
 
@@ -407,8 +476,15 @@ def main(_):
         eps=config.train.adam_epsilon,
     )
 
-    train_dataset = GenevalPromptDataset(config.dataset, "train")
-    test_dataset = GenevalPromptDataset(config.dataset, "test")
+    # --- Datasets and Dataloaders ---
+    if config.prompt_fn == "general_ocr":
+        train_dataset = TextPromptDataset(config.dataset, "train")
+        test_dataset = TextPromptDataset(config.dataset, "test")
+    elif config.prompt_fn == "geneval":
+        train_dataset = GenevalPromptDataset(config.dataset, "train")
+        test_dataset = GenevalPromptDataset(config.dataset, "test")
+    else:
+        raise NotImplementedError("Prompt function not supported with dataset")
 
     train_sampler = DistributedKRepeatSampler(
         dataset=train_dataset,
@@ -448,7 +524,7 @@ def main(_):
     # 异步计算奖励分数
     executor = futures.ThreadPoolExecutor(max_workers=8)  # Async reward computation
 
-    # eval_reward_fn = getattr(flow_grpo.rewards, "multi_score")(device, config.reward_fn)  # Pass device
+    eval_reward_fn = getattr(flow_grpo.rewards, "multi_score")(device, config.reward_fn)  # Pass device
     # eval_fn(
     #     pipeline,
     #     test_dataloader,
@@ -463,14 +539,15 @@ def main(_):
     #     mixed_precision_dtype,
     #     )
 
-    logger.info("***** Running RL Optimization *****")
-    logger.info(f"  Num Epochs = {config.num_epochs}")
-    logger.info(f"  Sample batch size per device = {config.sample.train_batch_size}")
-    logger.info(f"  Train batch size per device = {config.train.batch_size}")
-    logger.info(f"  Gradient Accumulation steps = {config.train.gradient_accumulation_steps}")
-    logger.info("")
-    logger.info(f"  Total number of samples per epoch = {samples_per_epoch}")
-    logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_train_batch_size}")
+    if is_main_process(rank):
+        logger.info("***** Running RL Optimization *****")
+        logger.info(f"  Num Epochs = {config.num_epochs}")
+        logger.info(f"  Sample batch size per device = {config.sample.train_batch_size}")
+        logger.info(f"  Train batch size per device = {config.train.batch_size}")
+        logger.info(f"  Gradient Accumulation steps = {config.train.gradient_accumulation_steps}")
+        logger.info("")
+        logger.info(f"  Total number of samples per epoch = {samples_per_epoch}")
+        logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_train_batch_size}")
 
     first_epoch = 0
     global_step = 0
@@ -482,6 +559,11 @@ def main(_):
 
     train_iter = iter(train_dataloader)
     optimizer.zero_grad()
+
+    # when to stop SFT from overfitting
+    threshold = -math.log(0.7)
+    sft_stop_patience = 0
+    should_stop = False
 
     for epoch in range(first_epoch, config.num_epochs):
         if hasattr(train_sampler, "set_epoch"):
@@ -510,35 +592,166 @@ def main(_):
             prompt_ids = tokenizers[0](
                 prompts, padding="max_length", max_length=256, truncation=True, return_tensors="pt"
             ).input_ids.to(device)
-            
-            with torch_autocast(enabled=enable_amp, dtype=mixed_precision_dtype):
-                with torch.no_grad():
-                    if is_main_process(rank) and global_step % config.log_interval == 0:
-                        start_time = time.perf_counter()
 
-                    # inference with full compute policy
-                    images, latents, _, prepared_latents = pipeline_with_logprob(
-                        pipeline,
-                        prompt_embeds=prompt_embeds,
-                        pooled_prompt_embeds=pooled_prompt_embeds,
-                        negative_prompt_embeds=sample_neg_prompt_embeds[: len(prompts)],
-                        negative_pooled_prompt_embeds=sample_neg_pooled_prompt_embeds[: len(prompts)],
-                        num_inference_steps=config.sample.num_steps,
-                        guidance_scale=config.sample.guidance_scale,
-                        output_type="pt",
-                        height=config.resolution,
-                        width=config.resolution,
-                        noise_level=config.sample.noise_level,
-                        deterministic=config.sample.deterministic,
-                        solver=config.sample.solver,
-                        model_type="sd3",
+            # if i == 0 and epoch % 10 == 0:
+            #     eval_fn(
+            #         pipeline,
+            #         test_dataloader,
+            #         text_encoders,
+            #         tokenizers,
+            #         config,
+            #         device,
+            #         rank,
+            #         world_size,
+            #         global_step,
+            #         eval_reward_fn,
+            #         executor,
+            #         mixed_precision_dtype,
+            #     )
+
+            if not config.sft:
+                with torch_autocast(enabled=enable_amp, dtype=mixed_precision_dtype):
+                    with torch.no_grad():
+                        if is_main_process(rank) and global_step % config.log_interval == 0:
+                            start_time = time.perf_counter()
+
+                        # inference with full compute policy
+                        images, _, _, prepared_latents = pipeline_with_logprob(
+                            pipeline,
+                            prompt_embeds=prompt_embeds,
+                            pooled_prompt_embeds=pooled_prompt_embeds,
+                            negative_prompt_embeds=sample_neg_prompt_embeds[: len(prompts)],
+                            negative_pooled_prompt_embeds=sample_neg_pooled_prompt_embeds[: len(prompts)],
+                            num_inference_steps=config.sample.num_steps,
+                            guidance_scale=config.sample.guidance_scale,
+                            output_type="pt",
+                            height=config.resolution,
+                            width=config.resolution,
+                            noise_level=config.sample.noise_level,
+                            deterministic=config.sample.deterministic,
+                            solver=config.sample.solver,
+                            model_type="sd3",
+                        )
+
+                        if is_main_process(rank):
+                            wandb.log({
+                                "sample/full_compute": wandb.Image(
+                                    images[0],
+                                    caption=prompts[0]
+                                    )
+                            },
+                            step=global_step,
+                            )
+
+                        if is_main_process(rank) and global_step % config.log_interval == 0:
+                            end_time_full = time.perf_counter()
+
+                    with torch.enable_grad():
+                        # inference with policy with cache
+                        images_cache, _, _, acceleration_policy_log_probs, num_full_steps, full_compute_steps = pipeline_with_logprob_layerwise_cache_batch(
+                            pipeline,
+                            prompt_embeds=prompt_embeds,
+                            pooled_prompt_embeds=pooled_prompt_embeds,
+                            negative_prompt_embeds=sample_neg_prompt_embeds[: len(prompts)],
+                            negative_pooled_prompt_embeds=sample_neg_pooled_prompt_embeds[: len(prompts)],
+                            num_inference_steps=config.sample.num_steps,
+                            guidance_scale=config.sample.guidance_scale,
+                            output_type="pt",
+                            height=config.resolution,
+                            width=config.resolution,
+                            noise_level=config.sample.noise_level,
+                            deterministic=config.sample.deterministic,
+                            solver=config.sample.solver,
+                            model_type="sd3",
+                            acceleration_policy=acceleration_policy_ddp.module,
+                            actions=config.ACTIONS,
+                            latents = prepared_latents, # use same initialization
+                            skipped_layers = None,
+                            sft = config.sft,
+                        )
+                        if is_main_process(rank):
+                            save_dir = "full_compute_log"
+                            os.makedirs(save_dir, exist_ok=True)  
+
+                            save_path = os.path.join(save_dir, f"{global_step}.json") 
+
+                            with open(save_path, "w") as f:
+                                json.dump(full_compute_steps, f, indent=2)
+
+                            wandb.log({
+                                "sample/cached": wandb.Image(
+                                    images_cache[0],
+                                    caption=prompts[0]
+                                    )
+                            },
+                            step=global_step,
+                            )
+
+                        if is_main_process(rank) and global_step % config.log_interval == 0:
+                            end_time_accel = time.perf_counter()
+
+                            t_full = end_time_full - start_time
+                            t_accel = end_time_accel - end_time_full
+                            accel_ratio = t_full / t_accel
+                            # Policy assigns different caching strategy to each sample within the batch
+                            reduced_steps = int(config.sample.num_steps - num_full_steps)
+                            # 初始化时全计算和cache的步数比大概为1:1
+                            
+                            logger.info(f"[Timer] Sampling with full compute: {t_full:.6f} s")
+                            logger.info(f"[Timer] Sampling with acceleration: {t_accel:.6f} s")
+                            logger.info(f"[Timer] Acceleration Ratio: {accel_ratio:.6f}")
+                            logger.info(f"[Averaged] Full compute steps: {int(num_full_steps)} | Cached steps: {reduced_steps}")
+
+                # latents = torch.stack(latents, dim=1) 
+                # latents_accelerated = torch.stack(latents_accelerated, dim=1)
+                # timesteps = pipeline.scheduler.timesteps.repeat(len(prompts), 1).to(device) 
+
+                rewards_future = executor.submit(reward_fn, images, prompts, prompt_metadata, only_strict=True)
+                rewards_future_cache = executor.submit(reward_fn, images_cache, prompts, prompt_metadata, only_strict=True)
+                score_details, _ = rewards_future.result()
+                score_details_cache, _ = rewards_future_cache.result()
+                time.sleep(0)
+
+                # ==================================================== Main part for acceleration policy update ====================================================
+                # print(score_details)
+                # score_details: a dict containing all sub-tasks of certain metrics
+                # 'avg' denotes a weighted sum of all metrics when multiple metrics are considered
+                # here because we only evaluate on Geneval, so 'avg' is equivalent
+                R_full = torch.tensor(score_details["avg"], device=device).detach()
+                R_cache = torch.tensor(score_details_cache["avg"], device=device).detach()
+                R_drop = R_cache - R_full
+
+                speedup = 1 - float(num_full_steps) / float(config.sample.num_steps)
+                R_speedup = torch.full((R_cache.shape[0],), speedup, device=device, dtype=R_cache.dtype)
+
+                R_final = config.alpha * R_cache + config.beta * R_speedup * R_drop - config.gamma * R_speedup * torch.relu(-R_drop)
+
+                # TODO: Apply scaler
+                acceleration_policy_log_probss_sum = acceleration_policy_log_probs.sum(dim=0)
+                advantage_acceleration = (R_final - R_final.mean()) / (R_final.std() + 1e-4)
+                loss_policy_acceleration = -(advantage_acceleration.detach() * acceleration_policy_log_probss_sum).mean()
+
+                optimizer.zero_grad()
+                loss_policy_acceleration.backward()
+                optimizer.step()
+
+                if is_main_process(rank):
+                    wandb.log(
+                        {
+                            "train/[Quality]R_full": R_full.mean().item(),
+                            "train/[Quality]R_cache": R_cache.mean().item(),
+                            "train/[Speedup]R_speedup": (1 - float(num_full_steps) / float(config.sample.num_steps)),
+                            "train/R_final": R_final.mean().item(),
+                            "train/advantage": advantage_acceleration.detach().mean().item(),
+                            "train/log_prob": acceleration_policy_log_probss_sum.mean().item(),
+                            "train/loss_policy": loss_policy_acceleration.item(),
+                        },
+                        step=global_step,
                     )
 
-                    if is_main_process(rank) and global_step % config.log_interval == 0:
-                        end_time_full = time.perf_counter()
-            
-                    # inference with policy with cache
-                    images_accelerated, latents_accelerated, _, acceleration_policy_log_probs, num_full_steps = pipeline_with_logprob_cached(
+            else:
+                with torch.enable_grad():
+                    _, _, _, sft_loss = pipeline_with_logprob_layerwise_cache_batch(
                         pipeline,
                         prompt_embeds=prompt_embeds,
                         pooled_prompt_embeds=pooled_prompt_embeds,
@@ -555,98 +768,133 @@ def main(_):
                         model_type="sd3",
                         acceleration_policy=acceleration_policy_ddp.module,
                         actions=config.ACTIONS,
-                        latents = prepared_latents, # using same initialization
+                        skipped_layers = None,
+                        sft = config.sft,
                     )
 
+                optimizer.zero_grad()
+                sft_loss.backward()
+                optimizer.step()
+
+                if is_main_process(rank):
+                    wandb.log(
+                        {
+                            "train/sft_loss": sft_loss.item(),
+                        },
+                        step=global_step,
+                    )
+                
+                if global_step > 150 and global_step % config.sft_eval_interval == 0:
+                    with torch.enable_grad():
+                        # inference with policy with cache
+                        _, _, _, acceleration_policy_log_probs, num_full_steps, full_compute_steps = pipeline_with_logprob_layerwise_cache_batch(
+                            pipeline,
+                            prompt_embeds=prompt_embeds,
+                            pooled_prompt_embeds=pooled_prompt_embeds,
+                            negative_prompt_embeds=sample_neg_prompt_embeds[: len(prompts)],
+                            negative_pooled_prompt_embeds=sample_neg_pooled_prompt_embeds[: len(prompts)],
+                            num_inference_steps=config.sample.num_steps,
+                            guidance_scale=config.sample.guidance_scale,
+                            output_type="pt",
+                            height=config.resolution,
+                            width=config.resolution,
+                            noise_level=config.sample.noise_level,
+                            deterministic=config.sample.deterministic,
+                            solver=config.sample.solver,
+                            model_type="sd3",
+                            acceleration_policy=acceleration_policy_ddp.module,
+                            actions=config.ACTIONS,
+                            skipped_layers = None,
+                            sft = False,
+                        )
+                        if is_main_process(rank):
+                            save_dir = "full_compute_log_sft"
+                            os.makedirs(save_dir, exist_ok=True)  
+
+                            save_path = os.path.join(save_dir, f"{global_step}.json") 
+
+                            with open(save_path, "w") as f:
+                                json.dump(full_compute_steps, f, indent=2)
+                            
+                            save_policy(acceleration_policy_ddp.module, f"ckpt_policy/{global_step}.pt")
+
+
+                    # with torch.no_grad():
+                    #     _, _, _, sft_loss_eval = pipeline_with_logprob_layerwise_cache_batch(
+                    #         pipeline,
+                    #         prompt_embeds=prompt_embeds,
+                    #         pooled_prompt_embeds=pooled_prompt_embeds,
+                    #         negative_prompt_embeds=sample_neg_prompt_embeds[: len(prompts)],
+                    #         negative_pooled_prompt_embeds=sample_neg_pooled_prompt_embeds[: len(prompts)],
+                    #         num_inference_steps=config.sample.num_steps,
+                    #         guidance_scale=config.sample.guidance_scale,
+                    #         output_type="pt",
+                    #         height=config.resolution,
+                    #         width=config.resolution,
+                    #         noise_level=config.sample.noise_level,
+                    #         deterministic=config.sample.deterministic,
+                    #         solver=config.sample.solver,
+                    #         model_type="sd3",
+                    #         acceleration_policy=acceleration_policy_ddp.module,
+                    #         actions=config.ACTIONS,
+                    #         skipped_layers=None,
+                    #         sft=True,   # 用 teacher loss 做评估
+                    #     )
+
+                    # # DDP：把各 rank 的 loss 做平均，避免某个 rank 的偶然 batch 触发停止
+                    # loss_tensor = torch.tensor([float(sft_loss_eval.item())], device="cuda")
+                    # dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
+                    # loss_mean = (loss_tensor / dist.get_world_size()).item()
+
+                    # # 置信度（几何平均意义上的 teacher action prob）
+                    # conf = math.exp(-loss_mean)
+
                     # if is_main_process(rank):
-                    #     save_image(images[0], '/work/SJTU/DiffusionAcceleration/test_outputs/original_output.png')
-                    #     save_image(images_accelerated[0], '/work/SJTU/DiffusionAcceleration/test_outputs/cached_output.png')
+                    #     wandb.log(
+                    #         {
+                    #             "eval/sft_loss": loss_mean,
+                    #             "eval/teacher_conf": conf,
+                    #         },
+                    #         step=global_step,
+                    #     )
 
-                    # print(num_full_steps)
+                    # # patience 逻辑
+                    # if is_main_process(rank):
+                    #     logger.info(f'sft loss at {global_step} is {loss_mean}')
+                    #     logger.info(f'threhold is {threshold}')
+                    
+                    # if loss_mean <= threshold:
+                    #     sft_stop_patience += 1
+                    #     if is_main_process(rank):
+                    #         logger.info(f'patience increased to {sft_stop_patience}')
+                    # else:
+                    #     sft_stop_patience = 0
+                    #     if is_main_process(rank):
+                    #         logger.info(f'patience reset')
 
-                    if is_main_process(rank) and global_step % config.log_interval == 0:
-                        end_time_accel = time.perf_counter()
+                    # stop_now = (sft_stop_patience >= 3)
 
-                        t_full = end_time_full - start_time
-                        t_accel = end_time_accel - end_time_full
-                        accel_ratio = t_full / t_accel
-                        # Policy assigns different caching strategy to each sample within the batch
-                        reduced_steps = int(config.sample.num_steps - num_full_steps.mean().item())
-                        # 初始化时全计算和cache的步数比大概为1:1
+                    # # 广播 stop flag，让所有 rank 同步退出
+                    # stop_flag = torch.tensor([1 if stop_now else 0], device="cuda", dtype=torch.int)
+                    # dist.broadcast(stop_flag, src=0)
+                    # stop_now = bool(stop_flag.item())
+
+                    # if stop_now:
+                    #     should_stop = True
+                    #     if is_main_process(rank):
+                    #         save_policy(acceleration_policy_ddp.module, f"ckpt_policy/0.99_{global_step}.pt")
+                    #     break
                         
-                        logger.info(f"[Timer] Sampling with full compute: {t_full:.6f} s")
-                        logger.info(f"[Timer] Sampling with acceleration: {t_accel:.6f} s")
-                        logger.info(f"[Timer] Acceleration Ratio: {accel_ratio:.6f}")
-                        logger.info(f"[Averaged] Full compute steps: {int(num_full_steps.mean().item())} | Cached steps: {reduced_steps}")
 
-            # latents = torch.stack(latents, dim=1) 
-            # latents_accelerated = torch.stack(latents_accelerated, dim=1)
-            # timesteps = pipeline.scheduler.timesteps.repeat(len(prompts), 1).to(device) 
-
-            rewards_future = executor.submit(reward_fn, images, prompts, prompt_metadata, only_strict=True)
-            rewards_future_accelerated = executor.submit(reward_fn, images_accelerated, prompts, prompt_metadata, only_strict=True)
-            score_details, _ = rewards_future.result()
-            score_details_accelerated, _ = rewards_future_accelerated.result()
-            time.sleep(0)
-
-            # ==================================================== Main part for acceleration policy update ====================================================
-            # print(score_details)
-            # score_details: a dict containing all sub-tasks of certain metrics
-            # 'avg' denotes a weighted sum of all metrics when multiple metrics are considered
-            # here because we only evaluate on Geneval, so 'avg' is equivalent
-            R_full = torch.tensor(score_details["avg"], device=device)
-            R_accelerated = torch.tensor(score_details_accelerated["avg"], device=device)
-            # print(R_full)
-            # print(R_accelerated)
-
-            delta = 0.03
-            R_threshold = R_full * (1 - delta)
-
-            reward_speedup = num_full_steps.float() / float(config.sample.num_steps)
-            reward_speedup = reward_speedup.squeeze(-1)
-
-            mask_bad  = R_accelerated < R_threshold 
-            mask_good = ~mask_bad
-
-            reward_final = torch.zeros_like(R_accelerated)
-
-            alpha = 1   # 质量惩罚强度
-            beta  = 0.1   # 加速奖励强度
-            # if image quality is below threshold → not encourage acceleration
-            reward_final[mask_bad] = R_accelerated[mask_bad] - alpha * (R_threshold[mask_bad] - R_accelerated[mask_bad])
-
-            # if image quality is above threshold → encourage acceleration
-            # print(R_accelerated)
-            # print(reward_speedup)
-            reward_final[mask_good] = R_accelerated[mask_good] + beta * reward_speedup[mask_good]
-
-            # TODO: Apply scaler
-            acceleration_policy_log_probss_sum = acceleration_policy_log_probs.sum(dim=0)
-            advantage_acceleration = (reward_final - reward_final.mean()) / (reward_final.std() + 1e-4)
-            loss_policy_acceleration = -(advantage_acceleration.detach() * acceleration_policy_log_probss_sum).mean()
-
-            optimizer.zero_grad()
-            loss_policy_acceleration.backward()
-            optimizer.step()
-
-            if is_main_process(rank) and global_step % config.log_interval == 0:
-                wandb.log(
-                    {
-                        "train/[Quality]Q_full_quality": R_full.mean().item(),
-                        "train/[Quality]Q_accel_quality": R_accelerated.mean().item(),
-                        "train/[Speedup]Q_accel_speedup": (num_full_steps.float() / float(config.sample.num_steps)).mean().item(),
-                        "train/Q_accel_final": reward_final.mean().item(),
-                        "train/loss_policy": loss_policy_acceleration.item(),
-                    },
-                    step=global_step,
-                )
+            # if should_stop:
+            #     break
             global_step += 1
 
             if ema is not None:
                 ema.step(policy_trainable_parameters, global_step)
 
-
-
+        # if should_stop:
+        #     break
 
 
 

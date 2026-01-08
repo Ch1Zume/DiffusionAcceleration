@@ -6,6 +6,8 @@ from dataclasses import dataclass
 import torch.distributed as dist
 import tqdm
 from functools import partial
+from collections import defaultdict
+import torch.nn.functional as F
 
 tqdm = partial(tqdm.tqdm, dynamic_ncols=True)
 
@@ -14,6 +16,7 @@ tqdm = partial(tqdm.tqdm, dynamic_ncols=True)
 def run_sampling(
     v_pred_fn,
     z,
+    timesteps,
     sigma_schedule,
     solver="flow",
     determistic=False,
@@ -75,7 +78,7 @@ def run_sampling(
     # all_log_probs = torch.stack(all_log_probs, dim=1)  # (batch_size, num_steps, 1)
     return latents, all_latents, all_log_probs
 
-def run_sampling_cached(
+def run_sampling_stepwise_cache(
     v_pred_fn,
     z,
     sigma_schedule,
@@ -123,7 +126,7 @@ def run_sampling_cached(
 
         # sample actions
         # log_probs = logΠ_θ(a_t | s_t); Π_θ: policy network, a_t: full compute or cache, s_t: timestep, latents, ...
-        t = torch.full((batch_size,), i, device=device, dtype=dtype)
+        current_timestep = torch.full((batch_size,), i, device=device, dtype=dtype)
         
         # z: [9, 16, 64, 64]-[batch_size, latent_channel, H, W]
         # returned action is an integer denoting the action idx
@@ -131,7 +134,7 @@ def run_sampling_cached(
         # The training loop wraps sampling in no_grad for the diffusion model; re-enable grads
         # here so the policy receives gradients from the log-prob term.
         with torch.enable_grad():
-            action, policy_log_probs = acceleration_policy.sample_action(actions, t, z, distance)
+            action, policy_log_probs = acceleration_policy.sample_action(actions, current_timestep, z, distance)
 
         # action: [B, 1]
         # proceed action in batch manner using mask
@@ -144,7 +147,7 @@ def run_sampling_cached(
         if full_mask.any():
             z_full = z[full_mask]                             # [B_full, C, H, W]
             # print(z_full.shape)
-            pred_full = v_pred_fn(z_full.to(dtype), sigma, full_mask)    # [B_full, C, H, W]
+            pred_full = v_pred_fn(z_full.to(dtype), sigma, full_mask, current_timestep)    # [B_full, C, H, W]
 
             pred[full_mask] = pred_full.to(pred.dtype)
 
@@ -167,6 +170,143 @@ def run_sampling_cached(
         # cache
         if cache_mask.any():
             pred[cache_mask] = cached_pred[cache_mask]
+
+            distance_neg = distance.clone()
+            distance_neg[cache_mask & (distance < 0)] -= 1
+            distance_neg[cache_mask & (distance >= 0)] = -1
+            distance = distance_neg
+            
+
+        # TODO: add more actions
+
+        # Note: latent z is updated below as the solver output
+        if solver == "flow":
+            z, pred_original, log_prob = flow_grpo_step(
+                model_output=pred.float(),
+                latents=z.float(),
+                eta=eta if not determistic else 0,
+                sigmas=sigma_schedule,
+                index=i,
+                prev_sample=None,
+            )
+        elif solver == "dance":
+            z, pred_original, log_prob = dance_grpo_step(
+                pred.float(), z.float(), eta if not determistic else 0, sigmas=sigma_schedule, index=i, prev_sample=None
+            )
+        elif solver == "ddim":
+            z, pred_original, log_prob = ddim_step(
+                pred.float(), z.float(), eta if not determistic else 0, sigmas=sigma_schedule, index=i, prev_sample=None
+            )
+        elif "dpm" in solver:
+            assert determistic
+            z, pred_original, log_prob = dpm_step(
+                order,
+                model_output=pred.float(),
+                sample=z.float(),
+                step_index=i,
+                timesteps=sigma_schedule[:-1],
+                sigmas=sigma_schedule,
+                dpm_state=dpm_state,
+            )
+        else:
+            assert False
+        z = z.to(dtype)
+        all_latents.append(z)
+        all_log_probs.append(log_prob)
+
+    latents = z.to(dtype)
+    # all_latents = torch.stack(all_latents, dim=1)  # (batch_size, num_steps + 1, 4, 64, 64)
+    # all_log_probs = torch.stack(all_log_probs, dim=1)  # (batch_size, num_steps, 1)
+    return latents, all_latents, all_log_probs, policy_log_probs, num_full_steps
+
+def run_sampling_layerwise_cache(
+    v_pred_fn,
+    z,
+    sigma_schedule,
+    solver="flow",
+    determistic=False,
+    eta=0.7,
+    acceleration_policy=None,
+    actions=None,
+    skipped_layers=None,
+):
+    """
+    z: latents
+    sigma: predicted noise
+    cache_actions:
+        - None: same as full compute
+        - Tensor: 0-full compute; 1-cache; decide for every single timestep
+    """
+    assert solver in ["flow", "dance", "ddim", "dpm1", "dpm2"]
+    dtype = z.dtype
+    device = z.device
+    all_latents = [z]
+    all_log_probs = []
+
+    num_steps = len(sigma_schedule) - 1
+    batch_size = z.shape[0]
+
+    # timesteps to last full compute (in positive integer) or cache (in negative integer), using abs value
+    dis = 0
+    distance = torch.full((batch_size,), dis, device=device, dtype=dtype)
+    num_full_steps = torch.full((batch_size,), 0, device=device, dtype=dtype)
+    # cache[batch_id][timestep][layer_idx] = features
+    cache_dict = defaultdict(lambda: defaultdict(dict))
+
+    if "dpm" in solver:
+        order = int(solver[-1])
+        dpm_state = DPMState(order=order)
+
+    # ====================== Predict actions one at a timestep ======================
+    # loop over the timesteps
+    for i in tqdm(
+        range(num_steps),
+        desc="Sampling Progress (cached)",
+        disable=not dist.is_initialized() or dist.get_rank() != 0,
+    ):
+        sigma = sigma_schedule[i]
+        pred = torch.empty_like(z, dtype=dtype, device=z.device)
+
+        # sample actions
+        # log_probs = logΠ_θ(a_t | s_t); Π_θ: policy network, a_t: full compute or cache, s_t: timestep, latents, ...
+        current_timestep = torch.full((batch_size,), i, device=device, dtype=dtype)
+        
+        # z: [9, 16, 64, 64]-[batch_size, latent_channel, H, W]
+        # returned action is an integer denoting the action idx
+        # 0: full compute; 1: cache; 2: skip; 3: dynamic resolution ...
+        # The training loop wraps sampling in no_grad for the diffusion model; re-enable grads
+        # here so the policy receives gradients from the log-prob term.
+        with torch.enable_grad():
+            action, policy_log_probs = acceleration_policy.sample_action(actions, current_timestep, z, distance)
+
+        # action: [B, 1]
+        # proceed action in batch manner using mask
+        full_mask  = (action == actions['full'])
+        idx_full = torch.nonzero(full_mask, as_tuple=True)[0]
+        cache_mask = (action == actions['cache'])
+        idx_cache = torch.nonzero(cache_mask, as_tuple=True)[0]
+
+
+        # full compute
+        if full_mask.any():
+            z_full = z[full_mask]                             # [B_full, C, H, W]
+            pred_full = v_pred_fn(z_full.to(dtype), sigma, full_mask, i, skipped_layers, use_cache=True, cache_dict=cache_dict, sample_idx=idx_full, action=actions['full'])    # [B_full, C, H, W]
+            pred[full_mask] = pred_full.to(pred.dtype)
+
+            # distance 更新：distance > 0 则 +1，否则置为 1
+            # distance: [B]
+            distance_pos = distance.clone()
+            distance_pos[full_mask & (distance > 0)] += 1
+            distance_pos[full_mask & (distance <= 0)] = 1
+            distance = distance_pos
+
+            num_full_steps[full_mask] += 1
+
+        # cache
+        if cache_mask.any():
+            z_cache = z[cache_mask] 
+            pred_cache = v_pred_fn(z_cache.to(dtype), sigma, cache_mask, i, skipped_layers, use_cache=True, cache_dict=cache_dict, sample_idx=idx_cache, action=actions['cache'])
+            pred[cache_mask] = pred_cache.to(pred.dtype)
 
             distance_neg = distance.clone()
             distance_neg[cache_mask & (distance < 0)] -= 1
@@ -214,6 +354,189 @@ def run_sampling_cached(
     # all_latents = torch.stack(all_latents, dim=1)  # (batch_size, num_steps + 1, 4, 64, 64)
     # all_log_probs = torch.stack(all_log_probs, dim=1)  # (batch_size, num_steps, 1)
     return latents, all_latents, all_log_probs, policy_log_probs, num_full_steps
+
+# ============================================= As of 12.15 using this ================================================
+def run_sampling_layerwise_batch_cache(
+    v_pred_fn,
+    z,
+    sigma_schedule,
+    solver="flow",
+    determistic=False,
+    eta=0.7,
+    acceleration_policy=None,
+    actions=None,
+    skipped_layers=None,
+    sft=None,
+):
+    """
+    z: latents
+    sigma: predicted noise
+    cache_actions:
+        - None: same as full compute
+        - Tensor: 0-full compute; 1-cache; decide for every single timestep
+    """
+    assert solver in ["flow", "dance", "ddim", "dpm1", "dpm2"]
+    dtype = z.dtype
+    device = z.device
+    all_latents = [z]
+    all_log_probs = []
+
+    num_steps = len(sigma_schedule) - 1
+    batch_size = z.shape[0]
+
+    # timesteps to last full compute (in positive integer) or cache (in negative integer), using abs value
+    distance = torch.full((batch_size,), 0, device=device, dtype=dtype)
+    num_full_steps = 0
+    # cache[timestep][layer_idx] = features
+    cache_dict = defaultdict(lambda: defaultdict(dict))
+    full_compute_steps = []
+    # Only the last two full-compute timesteps are needed for forecast.
+    cache_keep_steps = 2
+    # pre-defined action sequence for policy network to learn from
+    teacher_actions = [
+        # t:  0  1  2  3  4  5  6
+            0, 0, 0, 0, 0, 0, 0,
+
+        # t:  7  8  9 10 11 12
+            1, 1, 1, 1, 1, 0,
+
+        # t: 13 14 15 16 17 18
+            1, 1, 1, 1, 1, 0,
+
+        # t: 19 20 21 22 23 24
+            1, 1, 1, 1, 1, 0,
+
+        # t: 25 26 27 28 29 30
+            1, 1, 1, 1, 1, 0,
+
+        # t: 31 32 33 34 35 36
+            1, 1, 1, 1, 1, 0,
+
+        # t: 37 38 39
+            1, 1, 1
+        ]
+    sft_loss = 0
+
+    if "dpm" in solver:
+        order = int(solver[-1])
+        dpm_state = DPMState(order=order)
+
+    # ====================== Predict actions one at a timestep ======================
+    # loop over the timesteps
+    for i in tqdm(
+        range(num_steps),
+        desc="Sampling Progress (cached)",
+        disable=not dist.is_initialized() or dist.get_rank() != 0,
+    ):
+        sigma = sigma_schedule[i]
+        # print(sigma)
+        # print(f'sigma shape: {sigma.shape}')
+        pred = torch.empty_like(z, dtype=dtype, device=z.device)
+
+        # sample actions
+        # log_probs = logΠ_θ(a_t | s_t); Π_θ: policy network, a_t: full compute or cache, s_t: timestep, latents, ...
+        # current_timestep = torch.full((batch_size,), i, device=device, dtype=dtype)
+        current_timestep = torch.full((batch_size,), sigma * 1000, device=device, dtype=dtype)
+
+        if i < 6:
+            interval = 1
+        else:
+            interval = full_compute_steps[-1] - full_compute_steps[-2]
+        interval = torch.full((batch_size,), interval, device=device, dtype=dtype)
+        
+        # z: [9, 16, 64, 64]-[batch_size, latent_channel, H, W]
+        # returned action is an integer denoting the action idx
+        # 0: full compute; 1: cache; 2: skip; 3: dynamic resolution ...
+        # The training loop wraps sampling in no_grad for the diffusion model; re-enable grads
+        # here so the policy receives gradients from the log-prob term.
+        with torch.enable_grad():
+            if not sft:
+                action, policy_log_probs = acceleration_policy.sample_action(actions, current_timestep, i, z, distance, interval, batch_wise=True, sft=sft)
+            else:
+                logit = acceleration_policy(current_timestep, z, distance, interval, batch_wise=True, sft=sft)
+                teacher_action = teacher_actions[i]
+                target = torch.tensor([teacher_action], device=z.device, dtype=torch.long)
+                loss_step = F.cross_entropy(logit, target)
+                sft_loss += loss_step
+                action = torch.full((batch_size,), teacher_action , device=device, dtype=dtype)
+
+        if action[0] == actions['full']:
+            full_compute_steps.append(i)
+            # Only keep gradients for policy log-prob; diffusion forward should not build a graph.
+            with torch.no_grad():
+                pred = v_pred_fn(z.to(dtype), sigma, i, skipped_layers, cache_dict=cache_dict, action=actions['full'])
+
+            # distance 更新：distance > 0 则 +1，否则置为 1
+            # distance: [B]
+            distance_pos = distance.clone()
+            distance_pos += 1
+            distance = distance_pos
+
+            num_full_steps += 1
+
+            # 只保留最后两步的全计算做cache
+            if cache_keep_steps is not None and len(full_compute_steps) > cache_keep_steps:
+                keep_ts = set(full_compute_steps[-cache_keep_steps:])
+                for t in list(cache_dict.keys()):
+                    if t not in keep_ts:
+                        del cache_dict[t]
+            
+
+        # cache
+        else:
+            # Only keep gradients for policy log-prob; diffusion forward should not build a graph.
+            with torch.no_grad():
+                pred = v_pred_fn(z.to(dtype), sigma, i, skipped_layers, cache_dict=cache_dict, action=actions['cache'])
+
+            distance_neg = distance.clone()
+            distance_neg -= 1
+            distance = distance_neg
+
+        # TODO: add more actions
+
+        # Note: latent z is updated below as the solver output
+        if solver == "flow":
+            z, pred_original, log_prob = flow_grpo_step(
+                model_output=pred.float(),
+                latents=z.float(),
+                eta=eta if not determistic else 0,
+                sigmas=sigma_schedule,
+                index=i,
+                prev_sample=None,
+            )
+        elif solver == "dance":
+            z, pred_original, log_prob = dance_grpo_step(
+                pred.float(), z.float(), eta if not determistic else 0, sigmas=sigma_schedule, index=i, prev_sample=None
+            )
+        elif solver == "ddim":
+            z, pred_original, log_prob = ddim_step(
+                pred.float(), z.float(), eta if not determistic else 0, sigmas=sigma_schedule, index=i, prev_sample=None
+            )
+        elif "dpm" in solver:
+            assert determistic
+            z, pred_original, log_prob = dpm_step(
+                order,
+                model_output=pred.float(),
+                sample=z.float(),
+                step_index=i,
+                timesteps=sigma_schedule[:-1],
+                sigmas=sigma_schedule,
+                dpm_state=dpm_state,
+            )
+        else:
+            assert False
+        z = z.to(dtype)
+        all_latents.append(z)
+        all_log_probs.append(log_prob)
+
+    sft_loss = sft_loss / num_steps
+    latents = z.to(dtype)
+    # all_latents = torch.stack(all_latents, dim=1)  # (batch_size, num_steps + 1, 4, 64, 64)
+    # all_log_probs = torch.stack(all_log_probs, dim=1)  # (batch_size, num_steps, 1)
+    if not sft:
+        return latents, all_latents, all_log_probs, policy_log_probs, num_full_steps, full_compute_steps
+    else:
+        return latents, all_latents, all_log_probs, sft_loss
 
 def flow_grpo_step(
     model_output: torch.Tensor,

@@ -201,6 +201,22 @@ def calculate_zero_std_ratio(prompts, gathered_rewards):
     return zero_std_ratio, prompt_std_devs.mean()
 
 
+def save_image(img_tensor, filename):
+    """
+    img_tensor: [C,H,W], 值域 0~1 或 0~255 均可
+    filename: 保存路径，例如 "output.png"
+    """
+    img = img_tensor.detach().cpu().numpy()
+
+    # 如果是 0~1，转成 0~255
+    if img.max() <= 1.0:
+        img = img * 255
+
+    img = img.astype(np.uint8)
+    img = np.transpose(img, (1, 2, 0))  # CHW -> HWC
+
+    Image.fromarray(img).save(filename)
+    
 def eval_fn(
     pipeline,
     test_dataloader,
@@ -280,6 +296,9 @@ def eval_fn(
                     solver="flow",
                     model_type="sd3",
                 )
+
+        if is_main_process(rank):
+            save_image(images[0], '/work/SJTU/DiffusionAcceleration/test_outputs/eval_output.png')
 
         rewards_future = executor.submit(reward_fn, images, prompts, prompt_metadata, only_strict=False)
         time.sleep(0)

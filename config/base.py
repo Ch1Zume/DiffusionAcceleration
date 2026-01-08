@@ -112,7 +112,13 @@ def get_config():
         "cache": 1,
         }
     config.hidden_dim = 32
-    config.init_full_compute = 0.8
-    config.log_interval = 3
+    config.log_interval = 5
+    config.sft = False
+    config.sft_eval_interval = 10
+
+    ###### Policy Reward Function ######
+    config.alpha = 1.0
+    config.beta = 0.6
+    config.gamma = 0.2
 
     return config

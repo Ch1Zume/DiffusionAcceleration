@@ -10,7 +10,7 @@ def get_config(name):
 def _get_config(base_model="sd3", n_gpus=1, gradient_step_per_epoch=1, dataset="pickscore", reward_fn={}, name=""):
     config = base.get_config()
     assert base_model in ["sd3", "flux"]
-    assert dataset in ["pickscore", "ocr", "geneval"]
+    assert dataset in ["pickscore", "ocr", "geneval", "drawbench"]
 
     config.base_model = base_model
     config.dataset = os.path.join(os.getcwd(), f"dataset/{dataset}")
@@ -20,6 +20,7 @@ def _get_config(base_model="sd3", n_gpus=1, gradient_step_per_epoch=1, dataset="
         # config.sample.num_steps = 10
         config.sample.num_steps = 40 # for RL acceleration
         config.sample.eval_num_steps = 40
+        # used for inference
         config.sample.guidance_scale = 4.5
         config.resolution = 512
         config.train.beta = 0.0001 # strength of KL regularization
@@ -76,9 +77,11 @@ def _get_config(base_model="sd3", n_gpus=1, gradient_step_per_epoch=1, dataset="
     config.beta = 1.0
     config.train.adv_mode = "all"
 
-    config.sample.guidance_scale = 1.0
+    # used for training
+    # config.sample.guidance_scale = 1.0 
     config.sample.deterministic = True
     config.sample.solver = "dpm2"
+    # config.sample.solver = "flow"
     return config
 
 
@@ -125,6 +128,20 @@ def sd3_pickscore():
         dataset="pickscore",
         reward_fn=reward_fn,
         name="pickscore",
+    )
+    return config
+
+def sd3_imagereward():
+    reward_fn = {
+        "imagereward": 1.0,
+    }
+    config = _get_config(
+        base_model="sd3",
+        n_gpus=2,
+        gradient_step_per_epoch=1,
+        dataset="pickscore", # consistent with taylorseer
+        reward_fn=reward_fn,
+        name="imagereward",
     )
     return config
 

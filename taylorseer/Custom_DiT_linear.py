@@ -20,7 +20,7 @@ from diffusers.models.embeddings import CombinedTimestepTextProjEmbeddings, Patc
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.transformers.transformer_sd3 import SD3Transformer2DModel
 
-from cache_utils.attention_linear_computation import JTBlock
+from .attention_linear_computation import JTBlock, JTBlock_Batch
 
 logger = logging.get_logger(__name__)
 
@@ -85,8 +85,8 @@ class SD3SingleTransformerBlock(nn.Module):
 
         return hidden_states
 
-
-class DiT(
+# 这个class就只修改了JTBlock和forward
+class SD3Transformer2DModel_Taylor(
     ModelMixin, ConfigMixin, PeftAdapterMixin, FromOriginalModelMixin, SD3Transformer2DLoadersMixin
 ):
     """
@@ -164,7 +164,7 @@ class DiT(
 
         self.transformer_blocks = nn.ModuleList(
             [
-                JTBlock(
+                JTBlock_Batch(
                     dim=self.inner_dim,
                     num_attention_heads=num_attention_heads,
                     attention_head_dim=attention_head_dim,
@@ -332,9 +332,11 @@ class DiT(
         block_controlnet_hidden_states: List = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         return_dict: bool = True,
-        skip_layers: Optional[List[int]] = None,
-        cache_dic: Optional[dict] = None,
-        timestep_now: int=0,
+        skipped_layers: Optional[List[int]] = None,
+        use_cache: bool = False,
+        cache_dict: Optional[dict] = None,
+        current_timestep: int = 0,
+        action: int = 0,
     ) -> Union[torch.Tensor, Transformer2DModelOutput]:
         """
         The [`SD3Transformer2DModel`] forward method.
@@ -390,10 +392,12 @@ class DiT(
             ip_hidden_states, ip_temb = self.image_proj(ip_adapter_image_embeds, timestep)
 
             joint_attention_kwargs.update(ip_hidden_states=ip_hidden_states, temb=ip_temb)
+
         for index_block, block in enumerate(self.transformer_blocks):
-            # Skip specified layers
+            # Skip (not cache) specified layers
             c = time.time()
-            is_skip = True if skip_layers is not None and index_block in skip_layers else False
+            is_skip = True if (skipped_layers is not None and index_block in skipped_layers) else False
+            # if is_skip = True, neither of the followings will be activated
             if torch.is_grad_enabled() and self.gradient_checkpointing and not is_skip:
                 encoder_hidden_states, hidden_states = self._gradient_checkpointing_func(
                     block,
@@ -401,8 +405,9 @@ class DiT(
                     encoder_hidden_states,
                     temb,
                     joint_attention_kwargs,
-                    cache_dic,
-                    timestep_now,
+                    use_cache,
+                    cache_dict,
+                    current_timestep,
                     index_block,
                 )
             elif not is_skip:
@@ -411,13 +416,17 @@ class DiT(
                     encoder_hidden_states=encoder_hidden_states,
                     temb=temb,
                     joint_attention_kwargs=joint_attention_kwargs,
-                    cache_dic=cache_dic,
-                    timestep_now=timestep_now,
+                    use_cache=use_cache,
+                    cache_dict=cache_dict,
+                    current_timestep=current_timestep,
                     layer_idx=index_block,
+                    action=action,
                 )
+
             if block_controlnet_hidden_states is not None and block.context_pre_only is False:
                 interval_control = len(self.transformer_blocks) / len(block_controlnet_hidden_states)
                 hidden_states = hidden_states + block_controlnet_hidden_states[int(index_block / interval_control)]
+
         hidden_states = self.norm_out(hidden_states, temb)
         hidden_states = self.proj_out(hidden_states)
 

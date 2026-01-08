@@ -317,3 +317,7 @@ HPSv2
 *.err
 reward_ckpts/
 test_outputs/
+ckpt_policy/
+full_compute_log/
+full_compute_log_sft/
+TaylorSeer/
