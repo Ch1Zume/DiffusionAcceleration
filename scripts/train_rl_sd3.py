@@ -14,7 +14,7 @@ from regex import R
 from torch.cuda import device_count
 import flow_grpo.rewards
 from flow_grpo.stat_tracking import PerPromptStatTracker
-from flow_grpo.diffusers_patch.pipeline_with_logprob import pipeline_with_logprob, pipeline_with_logprob_layerwise_cache, pipeline_with_logprob_layerwise_cache_batch
+from flow_grpo.diffusers_patch.pipeline_with_logprob import pipeline_with_logprob, pipeline_with_logprob_cache
 from flow_grpo.diffusers_patch.train_dreambooth_lora_sd3 import encode_prompt
 import torch
 import torch.distributed as dist
@@ -37,6 +37,38 @@ from taylorseer.Custom_DiT_linear import SD3Transformer2DModel_Taylor
 tqdm = partial(tqdm.tqdm, dynamic_ncols=True)
 
 FLAGS = flags.FLAGS
+
+
+# [DEPRECATED] 已改用标准 GRPO 方式计算 advantage，此函数不再使用
+# def normalize_rewards_zscore(rewards, z_c=2.0):
+#     """
+#     对一个group的rewards进行z-score归一化，解决GRPO中同一prompt生成的样本reward接近的问题
+#     
+#     公式: r = 0.5 + 0.5 * clip(r^{norm} / Z_c, -1, 1)
+#     
+#     Args:
+#         rewards: tensor of shape (batch_size,)，同一个group内的rewards
+#         z_c: 缩放常数，用于控制clip之前的缩放程度，默认为2.0
+#              较大的z_c会使更多样本落在[-1,1]区间内（更平滑的分布）
+#              较小的z_c会使更多样本被clip到边界（更极端的正负划分）
+#     
+#     Returns:
+#         normalized_rewards: 归一化后的rewards，范围在[0, 1]之间
+#             - 高于均值的样本得到 > 0.5 的值
+#             - 低于均值的样本得到 < 0.5 的值
+#     """
+#     mean = rewards.mean()
+#     std = rewards.std()
+#     
+#     # z-score标准化：r^{norm} = (x - mean) / std
+#     r_norm = (rewards - mean) / (std + 1e-9)
+#     
+#     # 应用公式: r = 0.5 + 0.5 * clip(r^{norm} / Z_c, -1, 1)
+#     normalized = 0.5 + 0.5 * torch.clamp(r_norm / z_c, -1.0, 1.0)
+#     
+#     return normalized
+
+
 config_flags.DEFINE_config_file("config", "config/base.py", "Training configuration.")
 
 logger = logging.getLogger(__name__)
@@ -207,6 +239,7 @@ def eval_fn(
         num_workers=test_dataloader.num_workers,
     )
 
+    all_time_per_image = []
     for test_batch in tqdm(
         eval_loader,
         desc="Eval: ",
@@ -227,7 +260,29 @@ def eval_fn(
 
         with torch_autocast(enabled=(config.mixed_precision in ["fp16", "bf16"]), dtype=mixed_precision_dtype):
             with torch.no_grad():
-                images, _, _, _ = pipeline_with_logprob(
+
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                t0 = time.perf_counter()
+
+                # images, _, _, _ = pipeline_with_logprob(
+                #     pipeline,
+                #     prompt_embeds=prompt_embeds,
+                #     pooled_prompt_embeds=pooled_prompt_embeds,
+                #     negative_prompt_embeds=current_sample_neg_prompt_embeds,
+                #     negative_pooled_prompt_embeds=current_sample_neg_pooled_prompt_embeds,
+                #     num_inference_steps=config.sample.eval_num_steps,
+                #     guidance_scale=config.sample.guidance_scale,
+                #     output_type="pt",
+                #     height=config.resolution,
+                #     width=config.resolution,
+                #     noise_level=config.sample.noise_level,
+                #     deterministic=True,
+                #     solver="flow",
+                #     model_type="sd3",
+                # )
+
+                images, _, _ = pipeline_with_logprob_cache(
                     pipeline,
                     prompt_embeds=prompt_embeds,
                     pooled_prompt_embeds=pooled_prompt_embeds,
@@ -239,12 +294,26 @@ def eval_fn(
                     height=config.resolution,
                     width=config.resolution,
                     noise_level=config.sample.noise_level,
-                    deterministic=True,
-                    solver="flow",
+                    deterministic=config.sample.deterministic,
+                    solver=config.sample.solver,
                     model_type="sd3",
+                    actions=config.ACTIONS,
+                    skipped_layers=None,
+                    sft=config.sft,
+                    max_order=config.max_order,
+                    test=config.test,
+                    interval=config.interval,
                 )
-        if is_main_process(rank):
-            save_image(images[0], '/work/SJTU/DiffusionAcceleration/test_outputs/eval_output.png')
+
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                t1 = time.perf_counter()
+
+                time_per_image = (t1 - t0) / float(current_batch_size)
+
+                time_per_image_tensor = torch.tensor([time_per_image], device=device, dtype=torch.float32)
+                gathered_time_per_image = gather_tensor_to_all(time_per_image_tensor, world_size)
+                all_time_per_image.append(gathered_time_per_image.cpu().numpy())
 
         rewards_future = executor.submit(reward_fn, images, prompts, prompt_metadata, only_strict=False)
         time.sleep(0)
@@ -254,6 +323,9 @@ def eval_fn(
             rewards_tensor = torch.as_tensor(value, device=device).float()
             gathered_value = gather_tensor_to_all(rewards_tensor, world_size)
             all_rewards[key].append(gathered_value.numpy())
+
+    time_per_image_s = np.concatenate(all_time_per_image).astype(np.float32)  # seconds/image
+    time_per_image_ms = time_per_image_s * 1000.0
 
     if is_main_process(rank):
         final_rewards = {key: np.concatenate(value_list) for key, value_list in all_rewards.items()}
@@ -283,6 +355,7 @@ def eval_fn(
                         for idx, (prompt, reward) in enumerate(zip(sampled_prompts_log, sampled_rewards_log))
                     ],
                     **{f"eval_reward_{key}": np.mean(value[value != -10]) for key, value in final_rewards.items()},
+                    "eval_time_per_image": float(np.mean(time_per_image_ms)),
                 },
                 step=global_step,
             )
@@ -441,11 +514,21 @@ def main(_):
         acceleration_policy = Policy(
             T = config.sample.num_steps,
             num_actions = len(config.ACTIONS),
+            max_order = config.max_order,
             latent_channel = num_channels_latents,
             hidden_dim = config.hidden_dim,
+            mode = config.policy_mode,  # 'full_pred' or 'order_pred'
             ).to(device)
     else: # load pretrained network
-        acceleration_policy = load_policy('ckpt_policy/0.7_180.pt').to(device)
+        # acceleration_policy = Policy(
+        #     T = config.sample.num_steps,
+        #     num_actions = len(config.ACTIONS),
+        #     max_order = config.max_order,
+        #     latent_channel = num_channels_latents,
+        #     hidden_dim = config.hidden_dim,
+        #     mode = config.policy_mode,  # 'full_pred' or 'order_pred'
+        #     ).to(device)
+        acceleration_policy = load_policy(config.policy_ckpt).to(device)
     if is_main_process(rank):
         logger.info("***** Pre-trained Policy Network Loaded *****")
 
@@ -521,23 +604,31 @@ def main(_):
     samples_per_epoch = config.sample.train_batch_size * world_size * config.sample.num_batches_per_epoch
     total_train_batch_size = config.train.batch_size * world_size * config.train.gradient_accumulation_steps
 
+    # 初始化 per-prompt stat tracker（标准 GRPO）
+    if config.sample.num_image_per_prompt == 1:
+        config.per_prompt_stat_tracking = False
+    if config.per_prompt_stat_tracking:
+        stat_tracker = PerPromptStatTracker(config.sample.global_std)
+    
     # 异步计算奖励分数
     executor = futures.ThreadPoolExecutor(max_workers=8)  # Async reward computation
 
-    eval_reward_fn = getattr(flow_grpo.rewards, "multi_score")(device, config.reward_fn)  # Pass device
-    # eval_fn(
-    #     pipeline,
-    #     test_dataloader,
-    #     text_encoders,
-    #     tokenizers,
-    #     config,
-    #     device,
-    #     rank,
-    #     world_size,
-    #     eval_reward_fn,
-    #     executor,
-    #     mixed_precision_dtype,
-    #     )
+    if config.test:
+        eval_reward_fn = getattr(flow_grpo.rewards, "multi_score")(device, config.reward_fn)  # Pass device
+        eval_fn(
+            pipeline,
+            test_dataloader,
+            text_encoders,
+            tokenizers,
+            config,
+            device,
+            rank,
+            world_size,
+            1,
+            eval_reward_fn,
+            executor,
+            mixed_precision_dtype,
+            )
 
     if is_main_process(rank):
         logger.info("***** Running RL Optimization *****")
@@ -648,7 +739,7 @@ def main(_):
 
                     with torch.enable_grad():
                         # inference with policy with cache
-                        images_cache, _, _, acceleration_policy_log_probs, num_full_steps, full_compute_steps = pipeline_with_logprob_layerwise_cache_batch(
+                        images_cache, _, _, acceleration_policy_log_probs, num_full_steps, full_compute_steps, cache_steps_order = pipeline_with_logprob_cache(
                             pipeline,
                             prompt_embeds=prompt_embeds,
                             pooled_prompt_embeds=pooled_prompt_embeds,
@@ -668,16 +759,11 @@ def main(_):
                             latents = prepared_latents, # use same initialization
                             skipped_layers = None,
                             sft = config.sft,
+                            max_order = config.max_order,
+                            interval = config.interval,
                         )
+                        
                         if is_main_process(rank):
-                            save_dir = "full_compute_log"
-                            os.makedirs(save_dir, exist_ok=True)  
-
-                            save_path = os.path.join(save_dir, f"{global_step}.json") 
-
-                            with open(save_path, "w") as f:
-                                json.dump(full_compute_steps, f, indent=2)
-
                             wandb.log({
                                 "sample/cached": wandb.Image(
                                     images_cache[0],
@@ -688,6 +774,7 @@ def main(_):
                             )
 
                         if is_main_process(rank) and global_step % config.log_interval == 0:
+
                             end_time_accel = time.perf_counter()
 
                             t_full = end_time_full - start_time
@@ -701,6 +788,21 @@ def main(_):
                             logger.info(f"[Timer] Sampling with acceleration: {t_accel:.6f} s")
                             logger.info(f"[Timer] Acceleration Ratio: {accel_ratio:.6f}")
                             logger.info(f"[Averaged] Full compute steps: {int(num_full_steps)} | Cached steps: {reduced_steps}")
+
+                            save_dir = "full_compute_log"
+                            os.makedirs(save_dir, exist_ok=True)  
+
+                            save_path = os.path.join(save_dir, f"{global_step}.json") 
+
+                            with open(save_path, "w") as f:
+                                json.dump(full_compute_steps, f, indent=2)
+                            
+                            # 保存 cache 步的 order 信息
+                            order_log_dir = "order_log"
+                            os.makedirs(order_log_dir, exist_ok=True)
+                            order_save_path = os.path.join(order_log_dir, f"{global_step}.json")
+                            with open(order_save_path, "w") as f:
+                                json.dump(cache_steps_order, f, indent=2)
 
                 # latents = torch.stack(latents, dim=1) 
                 # latents_accelerated = torch.stack(latents_accelerated, dim=1)
@@ -719,16 +821,136 @@ def main(_):
                 # here because we only evaluate on Geneval, so 'avg' is equivalent
                 R_full = torch.tensor(score_details["avg"], device=device).detach()
                 R_cache = torch.tensor(score_details_cache["avg"], device=device).detach()
-                R_drop = R_cache - R_full
+                R_drop = R_cache - R_full  # 质量差距（负值表示质量下降）
+                R_quality_gap = R_full - R_cache  # 用于日志记录（正值表示质量下降）
 
                 speedup = 1 - float(num_full_steps) / float(config.sample.num_steps)
                 R_speedup = torch.full((R_cache.shape[0],), speedup, device=device, dtype=R_cache.dtype)
 
-                R_final = config.alpha * R_cache + config.beta * R_speedup * R_drop - config.gamma * R_speedup * torch.relu(-R_drop)
+                # 根据 policy_mode 选择不同的 reward 计算方式
+                # 方案1：直接奖励加速，惩罚质量损失
+                # R = alpha * R_cache + beta * R_speedup - gamma * relu(-R_drop)
+                if config.policy_mode == 'full_pred':
+                    # full_pred 模式：奖励质量 + 奖励加速 - 惩罚质量下降
+                    R_final = config.alpha * R_cache + config.beta * R_speedup - config.gamma * torch.relu(-R_drop)
+                elif config.policy_mode == 'order_pred':
+                    # order_pred 模式：加速比基本固定，直接使用质量差距作为 reward
+                    R_final = R_drop  # R_cache - R_full
+                else:
+                    # action_pred 模式：奖励质量 + 奖励加速 - 惩罚质量下降
+                    R_final = config.alpha * R_cache + config.beta * R_speedup - config.gamma * torch.relu(-R_drop)
 
-                # TODO: Apply scaler
+                # ==================== 标准 GRPO Advantage 计算 ====================
                 acceleration_policy_log_probss_sum = acceleration_policy_log_probs.sum(dim=0)
-                advantage_acceleration = (R_final - R_final.mean()) / (R_final.std() + 1e-4)
+                
+                # 跨进程聚合 rewards（标准 GRPO 需要全局统计）
+                R_final_gathered = gather_tensor_to_all(R_final, world_size).numpy()
+                prompt_ids_gathered = gather_tensor_to_all(prompt_ids, world_size)
+                prompts_all_decoded = pipeline.tokenizer.batch_decode(
+                    prompt_ids_gathered.cpu().numpy(), skip_special_tokens=True
+                )
+                
+                # 使用标准 GRPO 方式计算 advantage
+                if config.per_prompt_stat_tracking:
+                    # per-prompt 统计：同一 prompt 的样本进行对比
+                    advantages_all = stat_tracker.update(prompts_all_decoded, R_final_gathered)
+                    
+                    if is_main_process(rank):
+                        group_size, trained_prompt_num = stat_tracker.get_stats()
+                        wandb.log(
+                            {
+                                "grpo/group_size": group_size,
+                                "grpo/trained_prompt_num": trained_prompt_num,
+                            },
+                            step=global_step,
+                        )
+                    stat_tracker.clear()
+                else:
+                    # 全局 z-score 归一化（标准 GRPO）
+                    advantages_all = (R_final_gathered - R_final_gathered.mean()) / (R_final_gathered.std() + 1e-4)
+                
+                # 将 advantage 分发回当前进程
+                samples_per_gpu = R_final.shape[0]
+                if advantages_all.ndim == 1:
+                    advantages_all = advantages_all[:, None]
+                
+                advantage_acceleration = torch.from_numpy(
+                    advantages_all.reshape(world_size, samples_per_gpu, -1)[rank]
+                ).to(device).squeeze(-1)
+                
+                # ==================== Advantage 计算过程详细日志 ====================
+                if is_main_process(rank) and global_step % config.log_interval == 0:
+                    # 辅助函数：将 tensor 转为保留4位小数的列表字符串
+                    def fmt_list(t):
+                        return "[" + ", ".join(f"{x:.4f}" for x in t.tolist()) + "]"
+                    
+                    print("\n" + "="*80)
+                    print(f"[Step {global_step}] 标准 GRPO Advantage 计算详细日志")
+                    print("="*80)
+                    
+                    # Step 1: 原始 reward 值
+                    print("\n[Step 1] 原始 Reward 值:")
+                    print(f"  R_full (full compute scores):  {fmt_list(R_full)}")
+                    print(f"  R_cache (cache scores):        {fmt_list(R_cache)}")
+                    print(f"  R_full mean: {R_full.mean().item():.4f}, std: {R_full.std().item():.4f}")
+                    print(f"  R_cache mean: {R_cache.mean().item():.4f}, std: {R_cache.std().item():.4f}")
+                    
+                    # Step 2: 质量差距计算
+                    print("\n[Step 2] 质量差距计算:")
+                    print(f"  R_drop = R_cache - R_full (负值表示质量下降)")
+                    print(f"  R_drop: {fmt_list(R_drop)}")
+                    print(f"  R_drop mean: {R_drop.mean().item():.4f}, std: {R_drop.std().item():.4f}")
+                    print(f"  R_quality_gap (Full-Cache): {fmt_list(R_quality_gap)}")
+                    
+                    # Step 3: 加速比
+                    print("\n[Step 3] 加速比计算:")
+                    print(f"  num_full_steps: {num_full_steps}, total_steps: {config.sample.num_steps}")
+                    print(f"  speedup = 1 - {num_full_steps}/{config.sample.num_steps} = {speedup:.4f}")
+                    print(f"  R_speedup: {fmt_list(R_speedup)}")
+                    
+                    # Step 4: 最终 reward 计算
+                    print("\n[Step 4] 最终 Reward 计算:")
+                    print(f"  policy_mode: {config.policy_mode}")
+                    if config.policy_mode == 'full_pred':
+                        print(f"  公式: R_final = alpha*R_cache + beta*R_speedup - gamma*relu(-R_drop)")
+                        print(f"  参数: alpha={config.alpha}, beta={config.beta}, gamma={config.gamma}")
+                    elif config.policy_mode == 'order_pred':
+                        print(f"  公式: R_final = R_drop (order_pred模式直接使用质量差距)")
+                    else:
+                        print(f"  公式: R_final = alpha*R_cache + beta*R_speedup - gamma*relu(-R_drop) (action_pred模式)")
+                        print(f"  参数: alpha={config.alpha}, beta={config.beta}, gamma={config.gamma}")
+                    print(f"  R_final: {fmt_list(R_final)}")
+                    print(f"  R_final mean: {R_final.mean().item():.4f}, std: {R_final.std().item():.4f}")
+                    
+                    # Step 5: 跨进程聚合后的全局统计
+                    print("\n[Step 5] 标准 GRPO 全局统计:")
+                    print(f"  per_prompt_stat_tracking: {config.per_prompt_stat_tracking}")
+                    print(f"  R_final_gathered shape: {R_final_gathered.shape}")
+                    print(f"  R_final_gathered mean: {R_final_gathered.mean():.4f}")
+                    print(f"  R_final_gathered std: {R_final_gathered.std():.4f}")
+                    
+                    # Step 6: Advantage 计算
+                    print("\n[Step 6] Advantage 计算 (标准 GRPO):")
+                    print(f"  公式: advantage = (r - mean) / (std + 1e-4)")
+                    print(f"  advantage_acceleration: {fmt_list(advantage_acceleration)}")
+                    print(f"  advantage mean: {advantage_acceleration.mean().item():.4f}")
+                    print(f"  advantage std: {advantage_acceleration.std().item():.4f}")
+                    print(f"  advantage max: {advantage_acceleration.max().item():.4f}")
+                    print(f"  advantage min: {advantage_acceleration.min().item():.4f}")
+                    
+                    # Step 7: Log prob 信息
+                    print("\n[Step 7] Log Probability 信息:")
+                    print(f"  acceleration_policy_log_probs shape: {acceleration_policy_log_probs.shape}")
+                    print(f"  acceleration_policy_log_probss_sum: {fmt_list(acceleration_policy_log_probss_sum)}")
+                    print(f"  log_prob mean: {acceleration_policy_log_probss_sum.mean().item():.4f}")
+                    
+                    # 最终 loss 预览
+                    print("\n[最终] Loss 计算预览:")
+                    loss_components = advantage_acceleration.detach() * acceleration_policy_log_probss_sum
+                    print(f"  advantage * log_prob (每个样本): {fmt_list(loss_components)}")
+                    print(f"  -mean(advantage * log_prob) = loss: {-loss_components.mean().item():.4f}")
+                    print("="*80 + "\n")
+                
                 loss_policy_acceleration = -(advantage_acceleration.detach() * acceleration_policy_log_probss_sum).mean()
 
                 optimizer.zero_grad()
@@ -740,9 +962,13 @@ def main(_):
                         {
                             "train/[Quality]R_full": R_full.mean().item(),
                             "train/[Quality]R_cache": R_cache.mean().item(),
-                            "train/[Speedup]R_speedup": (1 - float(num_full_steps) / float(config.sample.num_steps)),
+                            "train/[Quality]Full-Cache": R_quality_gap.mean().item(),  # R_full - R_cache，正值表示质量下降
+                            "train/[Speedup]R_speedup": R_speedup.mean().item(),
                             "train/R_final": R_final.mean().item(),
+                            # "train/R_final_global_mean": R_final_gathered.mean(),  # 全局 reward 均值
+                            # "train/R_final_global_std": R_final_gathered.std(),    # 全局 reward 标准差
                             "train/advantage": advantage_acceleration.detach().mean().item(),
+                            # "train/advantage_abs_mean": advantage_acceleration.detach().abs().mean().item(),  # advantage 绝对值均值
                             "train/log_prob": acceleration_policy_log_probss_sum.mean().item(),
                             "train/loss_policy": loss_policy_acceleration.item(),
                         },
@@ -750,44 +976,9 @@ def main(_):
                     )
 
             else:
-                with torch.enable_grad():
-                    _, _, _, sft_loss = pipeline_with_logprob_layerwise_cache_batch(
-                        pipeline,
-                        prompt_embeds=prompt_embeds,
-                        pooled_prompt_embeds=pooled_prompt_embeds,
-                        negative_prompt_embeds=sample_neg_prompt_embeds[: len(prompts)],
-                        negative_pooled_prompt_embeds=sample_neg_pooled_prompt_embeds[: len(prompts)],
-                        num_inference_steps=config.sample.num_steps,
-                        guidance_scale=config.sample.guidance_scale,
-                        output_type="pt",
-                        height=config.resolution,
-                        width=config.resolution,
-                        noise_level=config.sample.noise_level,
-                        deterministic=config.sample.deterministic,
-                        solver=config.sample.solver,
-                        model_type="sd3",
-                        acceleration_policy=acceleration_policy_ddp.module,
-                        actions=config.ACTIONS,
-                        skipped_layers = None,
-                        sft = config.sft,
-                    )
-
-                optimizer.zero_grad()
-                sft_loss.backward()
-                optimizer.step()
-
-                if is_main_process(rank):
-                    wandb.log(
-                        {
-                            "train/sft_loss": sft_loss.item(),
-                        },
-                        step=global_step,
-                    )
-                
-                if global_step > 150 and global_step % config.sft_eval_interval == 0:
+                if global_step == 0:
                     with torch.enable_grad():
-                        # inference with policy with cache
-                        _, _, _, acceleration_policy_log_probs, num_full_steps, full_compute_steps = pipeline_with_logprob_layerwise_cache_batch(
+                        _, _, _, acceleration_policy_log_probs, num_full_steps, full_compute_steps, cache_steps_order = pipeline_with_logprob_cache(
                             pipeline,
                             prompt_embeds=prompt_embeds,
                             pooled_prompt_embeds=pooled_prompt_embeds,
@@ -806,15 +997,94 @@ def main(_):
                             actions=config.ACTIONS,
                             skipped_layers = None,
                             sft = False,
+                            max_order = config.max_order,
+                            interval = config.interval,
                         )
                         if is_main_process(rank):
-                            save_dir = "full_compute_log_sft"
-                            os.makedirs(save_dir, exist_ok=True)  
+                            order_log_dir = "order_log_sft"
+                            os.makedirs(order_log_dir, exist_ok=True)
+                            order_save_path = os.path.join(order_log_dir, "initial.json")
+                            with open(order_save_path, "w") as f:
+                                json.dump(cache_steps_order, f, indent=2)
 
-                            save_path = os.path.join(save_dir, f"{global_step}.json") 
+                with torch.enable_grad():
+                    _, _, _, sft_losses = pipeline_with_logprob_cache(
+                        pipeline,
+                        prompt_embeds=prompt_embeds,
+                        pooled_prompt_embeds=pooled_prompt_embeds,
+                        negative_prompt_embeds=sample_neg_prompt_embeds[: len(prompts)],
+                        negative_pooled_prompt_embeds=sample_neg_pooled_prompt_embeds[: len(prompts)],
+                        num_inference_steps=config.sample.num_steps,
+                        guidance_scale=config.sample.guidance_scale,
+                        output_type="pt",
+                        height=config.resolution,
+                        width=config.resolution,
+                        noise_level=config.sample.noise_level,
+                        deterministic=config.sample.deterministic,
+                        solver=config.sample.solver,
+                        model_type="sd3",
+                        acceleration_policy=acceleration_policy_ddp.module,
+                        actions=config.ACTIONS,
+                        skipped_layers = None,
+                        sft = config.sft,
+                        max_order = config.max_order,
+                        interval = config.interval,
+                    )
 
-                            with open(save_path, "w") as f:
-                                json.dump(full_compute_steps, f, indent=2)
+                optimizer.zero_grad()
+                sft_losses['total'].backward()
+                optimizer.step()
+
+                if is_main_process(rank):
+                    wandb.log(
+                        {
+                            "train/sft_loss": sft_losses['total'].item(),
+                            "train/sft_action_loss": sft_losses['action'].item(),
+                            "train/sft_order_loss": sft_losses['order'].item(),
+                        },
+                        step=global_step,
+                    )
+                
+                if global_step > 0 and global_step % config.sft_eval_interval == 0:
+                    with torch.enable_grad():
+                        # inference with policy with cache
+                        _, _, _, acceleration_policy_log_probs, num_full_steps, full_compute_steps, cache_steps_order = pipeline_with_logprob_cache(
+                            pipeline,
+                            prompt_embeds=prompt_embeds,
+                            pooled_prompt_embeds=pooled_prompt_embeds,
+                            negative_prompt_embeds=sample_neg_prompt_embeds[: len(prompts)],
+                            negative_pooled_prompt_embeds=sample_neg_pooled_prompt_embeds[: len(prompts)],
+                            num_inference_steps=config.sample.num_steps,
+                            guidance_scale=config.sample.guidance_scale,
+                            output_type="pt",
+                            height=config.resolution,
+                            width=config.resolution,
+                            noise_level=config.sample.noise_level,
+                            deterministic=config.sample.deterministic,
+                            solver=config.sample.solver,
+                            model_type="sd3",
+                            acceleration_policy=acceleration_policy_ddp.module,
+                            actions=config.ACTIONS,
+                            skipped_layers = None,
+                            sft = False,
+                            max_order = config.max_order,
+                            interval = config.interval,
+                        )
+                        if is_main_process(rank):
+                            # save_dir = "full_compute_log_sft"
+                            # os.makedirs(save_dir, exist_ok=True)  
+
+                            # save_path = os.path.join(save_dir, f"{global_step}.json") 
+
+                            # with open(save_path, "w") as f:
+                            #     json.dump(full_compute_steps, f, indent=2)
+                            
+                            # 保存 cache 步的 order 信息
+                            order_log_dir = "order_log_sft"
+                            os.makedirs(order_log_dir, exist_ok=True)
+                            order_save_path = os.path.join(order_log_dir, f"{global_step}.json")
+                            with open(order_save_path, "w") as f:
+                                json.dump(cache_steps_order, f, indent=2)
                             
                             save_policy(acceleration_policy_ddp.module, f"ckpt_policy/{global_step}.pt")
 

@@ -1,4 +1,5 @@
 import ml_collections
+from sympy.logic import false
 
 
 def get_config():
@@ -6,7 +7,7 @@ def get_config():
 
     ###### General ######
     # run name for wandb logging and checkpoint saving -- if not provided, will be auto-generated based on the datetime.
-    config.run_name = ""
+    config.run_name = "high order taylor"
     config.debug = False
 
     # random seed for reproducibility.
@@ -92,6 +93,7 @@ def get_config():
     train.lora_path = None
     train.ema = True
 
+
     ###### Prompt Function ######
     # prompt function to use. see `prompts.py` for available prompt functions.
     config.prompt_fn = ""
@@ -114,11 +116,26 @@ def get_config():
     config.hidden_dim = 32
     config.log_interval = 5
     config.sft = False
-    config.sft_eval_interval = 10
+    config.sft_eval_interval = 5
+    config.test = False
+    config.policy_ckpt = 'ckpt_policy/10.pt'
 
     ###### Policy Reward Function ######
+    # z_c: z-score归一化的缩放常数，用于reward归一化
+    # 公式: r = 0.5 + 0.5 * clip(r^{norm} / z_c, -1, 1)
+    # 较大的z_c使分布更平滑，较小的z_c使正负划分更极端
+    train.z_c = 2.0
     config.alpha = 1.0
     config.beta = 0.6
     config.gamma = 0.2
+
+    ###### TaylorSeer ######
+    config.max_order = 2
+    config.interval = 4  # action interval: 每隔 interval 步进行一次 full compute (仅 order_pred 模式使用)
+    # policy_mode 支持三种模式：
+    #   - 'full_pred': 同时预测 action 和 order
+    #   - 'order_pred': 只预测 order，action 由 interval 决定
+    #   - 'action_pred': 只预测 action，order 固定为 max_order
+    config.policy_mode = 'full_pred'
 
     return config

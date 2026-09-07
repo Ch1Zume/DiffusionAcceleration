@@ -18,8 +18,8 @@ def _get_config(base_model="sd3", n_gpus=1, gradient_step_per_epoch=1, dataset="
     if base_model == "sd3":
         config.pretrained.model = "stabilityai/stable-diffusion-3.5-medium"
         # config.sample.num_steps = 10
-        config.sample.num_steps = 40 # for RL acceleration
-        config.sample.eval_num_steps = 40
+        config.sample.num_steps = 28 # for RL acceleration
+        config.sample.eval_num_steps = 28
         # used for inference
         config.sample.guidance_scale = 4.5
         config.resolution = 512

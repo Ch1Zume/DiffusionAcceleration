@@ -280,7 +280,7 @@ def eval_fn(
 
         with torch_autocast(enabled=(config.mixed_precision in ["fp16", "bf16"]), dtype=mixed_precision_dtype):
             with torch.no_grad():
-                images, _, _ = pipeline_with_logprob(
+                images, _, _, _ = pipeline_with_logprob(
                     pipeline,
                     prompt_embeds=prompt_embeds,
                     pooled_prompt_embeds=pooled_prompt_embeds,
@@ -636,23 +636,23 @@ def main(_):
                 prompts, padding="max_length", max_length=256, truncation=True, return_tensors="pt"
             ).input_ids.to(device)
 
-            if i == 0 and epoch % config.eval_freq == 0 and not config.debug:
-                eval_fn(
-                    pipeline,
-                    test_dataloader,
-                    text_encoders,
-                    tokenizers,
-                    config,
-                    device,
-                    rank,
-                    world_size,
-                    global_step,
-                    eval_reward_fn,
-                    executor,
-                    mixed_precision_dtype,
-                    ema,
-                    transformer_trainable_parameters,
-                )
+            # if i == 0 and epoch % config.eval_freq == 0 and not config.debug:
+            #     eval_fn(
+            #         pipeline,
+            #         test_dataloader,
+            #         text_encoders,
+            #         tokenizers,
+            #         config,
+            #         device,
+            #         rank,
+            #         world_size,
+            #         global_step,
+            #         eval_reward_fn,
+            #         executor,
+            #         mixed_precision_dtype,
+            #         ema,
+            #         transformer_trainable_parameters,
+            #     )
 
             if i == 0 and epoch % config.save_freq == 0 and is_main_process(rank) and not config.debug:
                 save_ckpt(
@@ -670,7 +670,7 @@ def main(_):
             transformer_ddp.module.set_adapter("old")
             with torch_autocast(enabled=enable_amp, dtype=mixed_precision_dtype):
                 with torch.no_grad():
-                    images, latents, _ = pipeline_with_logprob(
+                    images, latents, _, _ = pipeline_with_logprob(
                         pipeline,
                         prompt_embeds=prompt_embeds,
                         pooled_prompt_embeds=pooled_prompt_embeds,
@@ -706,10 +706,10 @@ def main(_):
                 }
             )
 
-        if is_main_process(rank):
-            end_time = time.perf_counter()
-            reverse_time = end_time - start_time
-            print(f'Time for Reverse Rollout (image sampling): {reverse_time:.6f} s')
+        # if is_main_process(rank):
+        #     end_time = time.perf_counter()
+        #     reverse_time = end_time - start_time
+        #     print(f'Time for Reverse Rollout (image sampling): {reverse_time:.6f} s')
 
         for sample_item in tqdm(
             samples_data_list, desc="Waiting for rewards", disable=not is_main_process(rank), position=0
@@ -830,8 +830,8 @@ def main(_):
         total_batch_size_filtered, num_timesteps_filtered = filtered_samples["timesteps"].shape
 
         # TRAINING, reverse process
-        if is_main_process(rank):
-            start_time = time.perf_counter()
+        # if is_main_process(rank):
+        #     start_time = time.perf_counter()
         transformer_ddp.train()  # Sets DDP model and its submodules to train mode.
 
         # Total number of backward passes before an optimizer step
@@ -1087,11 +1087,11 @@ def main(_):
                 ):
                     ema.step(transformer_trainable_parameters, global_step)
         
-        if is_main_process(rank):
-            end_time = time.perf_counter()
-            forward_time = end_time - start_time
-            print(f'Time for Forward Process (noising): {forward_time:.6f} s')
-            print(f'Ratio of Forward/Reverse: {forward_time / reverse_time}')
+        # if is_main_process(rank):
+        #     end_time = time.perf_counter()
+        #     forward_time = end_time - start_time
+        #     print(f'Time for Forward Process (noising): {forward_time:.6f} s')
+        #     print(f'Ratio of Forward/Reverse: {forward_time / reverse_time}')
 
         if world_size > 1:
             dist.barrier()

@@ -65,15 +65,12 @@ cd ..
 # GenEval
 pip install -U openmim
 mim install mmengine
-git clone https://github.com/open-mmlab/mmcv.git
-cd mmcv; git checkout 1.x
-MMCV_WITH_OPS=1 FORCE_CUDA=1 pip install -e . -v
-cd ..
-
-git clone https://github.com/open-mmlab/mmdetection.git
-cd mmdetection; git checkout 2.x
-pip install -e . -v
-cd ..
+MMCV_DIR=/work/dependency/SJTU/DiffusionAcceleration/mmcv
+MMDETECTION_DIR=/work/dependency/SJTU/DiffusionAcceleration/mmdetection
+git -C "$MMCV_DIR" checkout 1.x
+MMCV_WITH_OPS=1 FORCE_CUDA=1 pip install -e "$MMCV_DIR" -v
+git -C "$MMDETECTION_DIR" checkout 2.x
+pip install -e "$MMDETECTION_DIR" -v
 
 pip install open-clip-torch clip-benchmark
 
@@ -157,3 +154,19 @@ We thank the [Flow-GRPO](https://github.com/yifan123/flow_grpo) project for prov
   year={2025}
 }
 ```
+
+## Local repository boundary
+
+This fork contains the DiffusionAcceleration research changes. Public source
+repositories and local dependency adaptations are stored separately under:
+
+```text
+/work/dependency/SJTU/DiffusionAcceleration/TaylorSeer
+/work/dependency/SJTU/DiffusionAcceleration/flow_grpo_patch
+/work/dependency/SJTU/DiffusionAcceleration/taylorseer_patch
+/work/dependency/SJTU/DiffusionAcceleration/mmcv
+/work/dependency/SJTU/DiffusionAcceleration/mmdetection
+```
+
+Checkpoints, reward-model files, logs, and evaluation outputs are local
+artifacts and are excluded from this repository.
