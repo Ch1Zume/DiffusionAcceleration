@@ -41,7 +41,7 @@ pip install -e .
 ```
 ## Reward Preparation
 
-Our supported reward models include [GenEval](https://github.com/djghosh13/geneval), [OCR](https://github.com/PaddlePaddle/PaddleOCR), [PickScore](https://github.com/yuvalkirstain/PickScore), [ClipScore](https://github.com/openai/CLIP), [HPSv2.1](https://github.com/tgxs002/HPSv2), [Aesthetic](https://github.com/christophschuhmann/improved-aesthetic-predictor), [ImageReward](https://github.com/zai-org/ImageReward) and [UnifiedReward](https://github.com/CodeGoat24/UnifiedReward). We additionally support `HPSv2.1` on top of FlowGRPO, and simplify `GenEval` from remote server to local. 
+Our supported reward models include [GenEval](https://github.com/djghosh13/geneval), [OCR](https://github.com/PaddlePaddle/PaddleOCR), [PickScore](https://github.com/yuvalkirstain/PickScore), [ClipScore](https://github.com/openai/CLIP), [HPSv2.1](https://github.com/tgxs002/HPSv2), [Aesthetic](https://github.com/christophschuhmann/improved-aesthetic-predictor), [ImageReward](https://github.com/zai-org/ImageReward) and [UnifiedReward](https://github.com/CodeGoat24/UnifiedReward). We additionally support `HPSv2.1` on top of FlowGRPO, and simplify `GenEval` from remote server to local.
 
 ### Checkpoints Downloading
 
@@ -65,8 +65,8 @@ cd ..
 # GenEval
 pip install -U openmim
 mim install mmengine
-MMCV_DIR=/work/dependency/SJTU/DiffusionAcceleration/mmcv
-MMDETECTION_DIR=/work/dependency/SJTU/DiffusionAcceleration/mmdetection
+MMCV_DIR=/work/dependency/SJTU/DiffusionRL/DiffusionNFT/mmcv
+MMDETECTION_DIR=/work/dependency/SJTU/DiffusionRL/DiffusionNFT/mmdetection
 git -C "$MMCV_DIR" checkout 1.x
 MMCV_WITH_OPS=1 FORCE_CUDA=1 pip install -e "$MMCV_DIR" -v
 git -C "$MMDETECTION_DIR" checkout 2.x
@@ -154,17 +154,3 @@ We thank the [Flow-GRPO](https://github.com/yifan123/flow_grpo) project for prov
   year={2025}
 }
 ```
-
-## Local repository boundary
-
-This fork contains the DiffusionAcceleration research changes. Public source
-repositories and local dependency adaptations are stored separately under:
-
-```text
-./flow_grpo_patch
-./taylorseer_patch
-(public TaylorSeer/MMCV/MMDetection checkouts are documented in the setup section)
-```
-
-Checkpoints, reward-model files, logs, and evaluation outputs are local
-artifacts and are excluded from this repository.
