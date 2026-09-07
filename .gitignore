@@ -365,3 +365,6 @@ order_log_sft/
 dataset/
 flow_grpo/
 taylorseer/
+
+# Archived source-level dependency patches are part of this repository
+!flow_grpo_patch/
